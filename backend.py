@@ -55,7 +55,7 @@ class Backend_Api:
                 }
                 assistant_accumulated = []
                 try:
-                    with requests.post(api_url, json=payload, stream=True, timeout=60) as r:
+                    with requests.post(api_url, json=payload, stream=True, timeout=(20, 300)) as r:
                         for line in r.iter_lines():
                             if line:
                                 line = line.decode('utf-8')
