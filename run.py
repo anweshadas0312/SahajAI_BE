@@ -7,7 +7,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bp import bp
 from website import Website
-from backend.backend import Backend_Api
+try:
+    from backend import Backend_Api
+except ImportError:
+    # pyrefly: ignore [missing-import]
+    from backend.backend import Backend_Api
 from babel_setup import create_babel
 from json import load
 from flask import Flask

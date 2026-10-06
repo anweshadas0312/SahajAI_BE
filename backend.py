@@ -1,6 +1,6 @@
 import re
 from datetime import datetime
-from g4f import ChatCompletion
+# from g4f import ChatCompletion
 from flask import request, Response, stream_with_context
 from requests import get
 from config import special_instructions
@@ -27,12 +27,22 @@ class Backend_Api:
 
         :return: Response object containing the generated conversation stream  
         """
-        conversation_id = request.json['conversation_id']
+        conversation_id = request.json.get('conversation_id', '')
+        workspace_id = request.json.get('workspace_id')
 
         try:
-            jailbreak = request.json['jailbreak']
-            model = request.json['model']
+            jailbreak = request.json.get('jailbreak', 'default')
+            model = request.json.get('model', 'mistral:latest')
             messages = build_messages(jailbreak)
+
+            # Persist user prompt to database
+            try:
+                import db
+                user_msg_content = request.json.get('meta', {}).get('content', {}).get('parts', [{}])[0].get('content', '')
+                if user_msg_content and conversation_id:
+                    db.add_message(conversation_id, 'user', user_msg_content)
+            except Exception as dbe:
+                print(f"[DB] Note: {dbe}")
 
             # Generate response
             def local_llm_stream():
@@ -43,21 +53,37 @@ class Backend_Api:
                     "messages": messages,
                     "stream": True
                 }
-                with requests.post(api_url, json=payload, stream=True) as r:
-                    for line in r.iter_lines():
-                        if line:
-                            line = line.decode('utf-8')
-                            if line.startswith('data: '):
-                                data = line[6:]
-                                if data == '[DONE]':
-                                    break
-                                try:
-                                    chunk = json.loads(data)
-                                    content = chunk['choices'][0].get('delta', {}).get('content', '')
-                                    if content:
-                                        yield content
-                                except json.JSONDecodeError:
-                                    pass
+                assistant_accumulated = []
+                try:
+                    with requests.post(api_url, json=payload, stream=True, timeout=60) as r:
+                        for line in r.iter_lines():
+                            if line:
+                                line = line.decode('utf-8')
+                                if line.startswith('data: '):
+                                    data = line[6:]
+                                    if data == '[DONE]':
+                                        break
+                                    try:
+                                        chunk = json.loads(data)
+                                        content = chunk['choices'][0].get('delta', {}).get('content', '')
+                                        if content:
+                                            assistant_accumulated.append(content)
+                                            yield content
+                                    except json.JSONDecodeError:
+                                        pass
+                except Exception as req_err:
+                    err_msg = f"\n[LLM Service Note: {str(req_err)}]"
+                    assistant_accumulated.append(err_msg)
+                    yield err_msg
+
+                # Persist completed assistant message to database
+                if assistant_accumulated and conversation_id:
+                    try:
+                        import db
+                        full_reply = "".join(assistant_accumulated)
+                        db.add_message(conversation_id, 'assistant', full_reply)
+                    except Exception as dbe:
+                        print(f"[DB] Note: {dbe}")
 
             response = local_llm_stream()
 
