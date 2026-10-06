@@ -61,7 +61,17 @@ def login():
 
     try:
         user = db.get_user_by_username_or_email(identifier)
-        if not user or not check_password_hash(user['password_hash'], password):
+        if not user:
+            return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
+
+        # Check if the user was registered via Google OAuth
+        if not user.get('password_hash'):
+            return jsonify({
+                'success': False,
+                'error': 'This account is registered via Google Sign-In. Please click "Sign in with Google" to continue.'
+            }), 400
+
+        if not check_password_hash(user['password_hash'], password):
             return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
 
         token = generate_token(user['id'], user['role'])
@@ -74,11 +84,90 @@ def login():
                 'id': user['id'],
                 'username': user['username'],
                 'email': user['email'],
-                'role': user['role']
+                'role': user['role'],
+                'auth_provider': user.get('auth_provider', 'local')
             }
         })
     except Exception as e:
         return jsonify({'success': False, 'error': f"Database error: {str(e)}"}), 500
+
+
+from config import google_client_id as GOOGLE_CLIENT_ID
+
+@api_bp.route('/auth/google', methods=['POST'])
+def google_auth():
+    data = request.get_json() or {}
+    token = data.get('token')
+    if not token:
+        return jsonify({'success': False, 'error': 'Google token is required'}), 400
+
+    try:
+        id_info = None
+        # Try google.oauth2 id_token verification first
+        try:
+            from google.oauth2 import id_token
+            from google.auth.transport import requests as google_requests
+            id_info = id_token.verify_oauth2_token(
+                token, google_requests.Request(), GOOGLE_CLIENT_ID
+            )
+        except Exception as auth_lib_err:
+            # Fallback to direct Google tokeninfo endpoint
+            import requests as req
+            resp = req.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={token}", timeout=10)
+            if resp.status_code == 200:
+                id_info = resp.json()
+            else:
+                raise Exception(f"Google token verification failed: {resp.text}")
+
+        if not id_info:
+            return jsonify({'success': False, 'error': 'Could not verify Google token'}), 400
+
+        email = id_info.get('email', '').strip().lower()
+        if not email:
+            return jsonify({'success': False, 'error': 'No email returned from Google'}), 400
+
+        # Get Google Profile Display Name (e.g. "Anindita Das")
+        display_name = id_info.get('name', '').strip() or id_info.get('given_name', '').strip() or email.split('@')[0]
+
+        # Check if user already exists
+        user = db.get_user_by_username_or_email(email)
+        if not user:
+            # Ensure unique username
+            username = display_name
+            counter = 1
+            while db.get_user_by_username_or_email(username):
+                username = f"{display_name} ({counter})"
+                counter += 1
+
+            # Create user with password_hash=None and auth_provider='google'
+            user_id = db.create_user(
+                username=username,
+                email=email,
+                password_hash=None,
+                role='user',
+                auth_provider='google'
+            )
+            user = db.get_user_by_id(user_id)
+            db.log_audit(user_id, 'USER_GOOGLE_REGISTER', f"Registered via Google OAuth: {username} ({email})")
+        else:
+            db.log_audit(user['id'], 'USER_GOOGLE_LOGIN', f"Logged in via Google OAuth: {user['username']}")
+
+        auth_token = generate_token(user['id'], user['role'])
+
+        return jsonify({
+            'success': True,
+            'token': auth_token,
+            'user': {
+                'id': user['id'],
+                'username': user['username'],
+                'email': user['email'],
+                'role': user['role'],
+                'auth_provider': user.get('auth_provider', 'google')
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': f"Google authentication failed: {str(e)}"}), 400
 
 
 @api_bp.route('/auth/me', methods=['GET'])

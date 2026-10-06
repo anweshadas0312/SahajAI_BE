@@ -66,11 +66,22 @@ def init_db():
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     username VARCHAR(100) NOT NULL UNIQUE,
                     email VARCHAR(191) NOT NULL UNIQUE,
-                    password_hash VARCHAR(255) NOT NULL,
+                    password_hash VARCHAR(255) NULL,
+                    auth_provider VARCHAR(50) DEFAULT 'local',
                     role ENUM('admin', 'user') DEFAULT 'user',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
+
+            # Ensure existing table has nullable password_hash and auth_provider column
+            try:
+                cursor.execute("ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) NULL;")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN auth_provider VARCHAR(50) DEFAULT 'local';")
+            except Exception:
+                pass
 
             # Workspaces
             cursor.execute("""
@@ -169,7 +180,7 @@ def get_user_by_id(user_id):
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, username, email, role, created_at FROM users WHERE id = %s", (user_id,))
+            cursor.execute("SELECT id, username, email, role, auth_provider, created_at FROM users WHERE id = %s", (user_id,))
             return cursor.fetchone()
     finally:
         conn.close()
@@ -185,13 +196,13 @@ def get_user_by_username_or_email(identifier):
         conn.close()
 
 
-def create_user(username, email, password_hash, role='user'):
+def create_user(username, email, password_hash=None, role='user', auth_provider='local'):
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO users (username, email, password_hash, role) VALUES (%s, %s, %s, %s)",
-                (username, email, password_hash, role)
+                "INSERT INTO users (username, email, password_hash, auth_provider, role) VALUES (%s, %s, %s, %s, %s)",
+                (username, email, password_hash, auth_provider, role)
             )
             user_id = cursor.lastrowid
             # Automatically create a default workspace
@@ -209,7 +220,7 @@ def get_all_users():
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT u.id, u.username, u.email, u.role, u.created_at,
+                SELECT u.id, u.username, u.email, u.role, u.auth_provider, u.created_at,
                        COUNT(DISTINCT w.id) AS workspace_count,
                        COUNT(DISTINCT c.id) AS conversation_count
                 FROM users u
