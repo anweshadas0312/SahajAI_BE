@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 import db
 from auth import generate_token, token_required, admin_required
@@ -344,3 +344,160 @@ def get_db_status():
         return jsonify({'connected': True, 'type': 'MySQL', 'message': 'MySQL connected successfully'})
     except Exception as e:
         return jsonify({'connected': False, 'type': 'MySQL', 'error': str(e)}), 200
+
+
+# ==========================================
+# FILE INTELLIGENCE ENDPOINTS
+# ==========================================
+
+ALLOWED_EXTENSIONS = {
+    '.pdf', '.docx', '.txt', '.md', '.csv', '.xlsx', '.xls',
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.json', '.html', '.css', '.sql', '.xml'
+}
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB cap
+
+import os, uuid
+import rag_engine
+
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+@api_bp.route('/files/upload', methods=['POST'])
+@token_required
+def upload_file():
+    user = request.current_user
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file part in the request'}), 400
+
+    uploaded_file = request.files['file']
+    if not uploaded_file or uploaded_file.filename == '':
+        return jsonify({'success': False, 'error': 'No selected file'}), 400
+
+    original_name = uploaded_file.filename
+    ext = os.path.splitext(original_name)[1].lower()
+
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({'success': False, 'error': f'Unsupported file type: {ext}'}), 400
+
+    # Calculate file size
+    uploaded_file.seek(0, os.SEEK_END)
+    file_size = uploaded_file.tell()
+    uploaded_file.seek(0)
+
+    if file_size > MAX_FILE_SIZE:
+        return jsonify({'success': False, 'error': 'File size exceeds maximum limit of 25 MB'}), 400
+
+    workspace_id = request.form.get('workspace_id')
+    conversation_id = request.form.get('conversation_id')
+
+    if workspace_id and workspace_id.isdigit():
+        workspace_id = int(workspace_id)
+    else:
+        workspace_id = None
+
+    file_id = str(uuid.uuid4())
+    safe_storage_name = f"{file_id}{ext}"
+    storage_path = os.path.join(UPLOAD_DIR, safe_storage_name)
+
+    try:
+        uploaded_file.save(storage_path)
+        mime_type = uploaded_file.mimetype or 'application/octet-stream'
+
+        # Record file entry in DB
+        db.create_file_record(file_id, user['id'], workspace_id, original_name, storage_path, mime_type, file_size)
+
+        if conversation_id:
+            db.link_file_to_conversation(conversation_id, file_id)
+
+        # Process file RAG embedding
+        success = rag_engine.process_and_store_file(file_id, storage_path, mime_type, original_name)
+
+        file_data = db.get_file_by_id(file_id, user_id=user['id'])
+
+        return jsonify({
+            'success': True,
+            'file': {
+                'id': file_data['id'],
+                'original_name': file_data['original_name'],
+                'file_size': file_data['file_size'],
+                'mime_type': file_data['mime_type'],
+                'status': file_data['status'],
+                'error_message': file_data['error_message']
+            }
+        }), 201
+
+    except Exception as e:
+        print(f"[File Upload Error] {e}")
+        return jsonify({'success': False, 'error': f'File upload failed: {str(e)}'}), 500
+
+
+@api_bp.route('/files/<file_id>/status', methods=['GET'])
+@token_required
+def get_file_status(file_id):
+    user = request.current_user
+    file_data = db.get_file_by_id(file_id, user_id=user['id'])
+    if not file_data:
+        return jsonify({'success': False, 'error': 'File not found'}), 404
+    return jsonify({
+        'success': True,
+        'file': {
+            'id': file_data['id'],
+            'original_name': file_data['original_name'],
+            'status': file_data['status'],
+            'error_message': file_data['error_message']
+        }
+    })
+
+
+@api_bp.route('/files/conversation/<conversation_id>', methods=['GET'])
+@token_required
+def get_conversation_attached_files(conversation_id):
+    user = request.current_user
+    files = db.get_conversation_files(conversation_id, user_id=user['id'])
+    return jsonify({
+        'success': True,
+        'files': [{
+            'id': f['id'],
+            'original_name': f['original_name'],
+            'file_size': f['file_size'],
+            'status': f['status']
+        } for f in files]
+    })
+
+
+@api_bp.route('/files/<file_id>', methods=['DELETE'])
+@token_required
+def delete_file(file_id):
+    user = request.current_user
+    success = db.delete_file_record(file_id, user_id=user['id'])
+    if success:
+        return jsonify({'success': True, 'message': 'File deleted successfully'})
+    return jsonify({'success': False, 'error': 'File not found or unauthorized'}), 404
+
+
+@api_bp.route('/files/<file_id>/view', methods=['GET'])
+def view_file_content(file_id):
+    try:
+        file_data = db.get_file_by_id(file_id)
+        if not file_data:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+
+        storage_path = file_data.get('storage_path')
+        if not storage_path or not os.path.exists(storage_path):
+            return jsonify({'success': False, 'error': 'Physical file missing on server'}), 404
+
+        mime = file_data.get('mime_type') or 'application/octet-stream'
+        # For PDFs or images, inline view; otherwise download
+        as_attachment = False if mime in ['application/pdf', 'text/plain', 'text/html', 'image/png', 'image/jpeg'] else True
+
+        return send_file(
+            storage_path,
+            mimetype=mime,
+            as_attachment=as_attachment,
+            download_name=file_data.get('original_name', 'document')
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+

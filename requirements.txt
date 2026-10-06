@@ -28,3 +28,8 @@ browser_cookie3
 duckduckgo-search
 
 ddgs
+PyPDF2
+python-docx
+pandas
+openpyxl
+

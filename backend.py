@@ -110,14 +110,50 @@ def build_messages(jailbreak):
     _conversation = request.json['meta']['content']['conversation']
     internet_access = request.json['meta']['content']['internet_access']
     prompt = request.json['meta']['content']['parts'][0]
+    user_prompt_text = prompt.get("content", "")
+
+    conversation_id = request.json.get('conversation_id', '')
+    payload_file_ids = request.json.get('meta', {}).get('file_ids', [])
+
+    # Link payload file_ids to conversation if provided
+    if conversation_id and payload_file_ids:
+        try:
+            import db
+            for fid in payload_file_ids:
+                db.link_file_to_conversation(conversation_id, fid)
+        except Exception as e:
+            print(f"[Backend] Warning linking files: {e}")
+
+    # Fetch all files linked to this conversation
+    active_file_ids = list(payload_file_ids)
+    if conversation_id:
+        try:
+            import db
+            conv_files = db.get_conversation_files(conversation_id)
+            for cf in conv_files:
+                if cf['id'] not in active_file_ids:
+                    active_file_ids.append(cf['id'])
+        except Exception as e:
+            print(f"[Backend] Error fetching conversation files: {e}")
 
     # Add the existing conversation
-    conversation = _conversation
+    conversation = list(_conversation)
+
+    # RAG File Retrieval if files attached
+    if active_file_ids and user_prompt_text:
+        try:
+            import rag_engine
+            results, max_sim = rag_engine.retrieve_relevant_chunks(active_file_ids, user_prompt_text, top_k=4)
+            if results:
+                file_context_msg = rag_engine.format_context_block(results)
+                conversation.insert(0, {'role': 'system', 'content': file_context_msg})
+        except Exception as rage:
+            print(f"[RAG Engine Warning]: {rage}")
 
     # Add web results if enabled
     if internet_access:
         current_date = datetime.now().strftime("%Y-%m-%d")
-        query = f'Current date: {current_date}. ' + prompt["content"]
+        query = f'Current date: {current_date}. ' + user_prompt_text
         search_results = fetch_search_results(query)
         conversation.extend(search_results)
 
@@ -129,10 +165,11 @@ def build_messages(jailbreak):
     conversation.append(prompt)
 
     # Reduce conversation size to avoid API Token quantity error
-    if len(conversation) > 3:
-        conversation = conversation[-4:]
+    if len(conversation) > 5:
+        conversation = conversation[-5:]
 
     return conversation
+
 
 
 def fetch_search_results(query):

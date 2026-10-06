@@ -2,8 +2,14 @@ import secrets
 import os
 import sys
 
-# Ensure the root directory is in the python path so 'backend.*' imports work
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure current directory is at the top of sys.path
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
+parent_dir = os.path.dirname(backend_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(1, parent_dir)
+
 
 from bp import bp
 from website import Website
@@ -16,17 +22,14 @@ from babel_setup import create_babel
 from json import load
 from flask import Flask
 
-if __name__ == '__main__':
-
-    # Load configuration from config.json (which is now in the backend directory)
+def create_app():
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
     if not os.path.exists(config_path):
         config_path = 'config.json'
     config = load(open(config_path, 'r'))
     site_config = config['site_config']
-    url_prefix = config.pop('url_prefix')
+    url_prefix = config.pop('url_prefix', '')
 
-    # Create the app
     app = Flask(__name__)
     app.secret_key = secrets.token_hex(16)
 
@@ -54,13 +57,15 @@ if __name__ == '__main__':
     # Register the blueprint
     app.register_blueprint(bp, url_prefix=url_prefix)
 
-    # Register modern Auth, Workspace, and Admin API blueprint
+    # Register modern Auth, Workspace, File Intelligence, and Admin API blueprint
     try:
         from api_routes import api_bp
         app.register_blueprint(api_bp)
-        print("[API] Successfully registered /api routes (auth, workspaces, admin)")
+        print("[API] Successfully registered /api routes (auth, workspaces, files, admin)")
     except Exception as e:
-        print(f"[API] Error loading api_routes: {e}")
+        print(f"[API] ERROR loading api_routes: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Enable CORS for frontend requests
     try:
@@ -76,7 +81,13 @@ if __name__ == '__main__':
     except Exception as dbe:
         print(f"[DB] Database startup check: {dbe}")
 
+    return app, site_config
+
+app, site_config = create_app()
+
+if __name__ == '__main__':
     # Run the Flask server
-    print(f"Running on {site_config['port']}{url_prefix}")
+    print(f"Running on {site_config['port']}")
     app.run(**site_config)
     print(f"Closing port {site_config['port']}")
+
