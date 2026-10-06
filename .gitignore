@@ -45,3 +45,5 @@ translations/
 *.mo
 *.pot
 translations/**/LC_MESSAGES/*.mo
+
+uploads/
