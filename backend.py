@@ -40,7 +40,7 @@ class Backend_Api:
                 import db
                 user_msg_content = request.json.get('meta', {}).get('content', {}).get('parts', [{}])[0].get('content', '')
                 if user_msg_content and conversation_id:
-                    db.add_message(conversation_id, 'user', user_msg_content)
+                    db.add_message(conversation_id, 'user', user_msg_content, workspace_id=workspace_id)
             except Exception as dbe:
                 print(f"[DB] Note: {dbe}")
 
@@ -81,7 +81,7 @@ class Backend_Api:
                     try:
                         import db
                         full_reply = "".join(assistant_accumulated)
-                        db.add_message(conversation_id, 'assistant', full_reply)
+                        db.add_message(conversation_id, 'assistant', full_reply, workspace_id=workspace_id)
                     except Exception as dbe:
                         print(f"[DB] Note: {dbe}")
 

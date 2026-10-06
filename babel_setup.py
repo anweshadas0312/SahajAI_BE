@@ -35,16 +35,31 @@ def get_languages():
     return jsonify(BABEL_LANGUAGES)
 
 
+import sys
+
 def compile_translations():
     """Compile the translation files."""
-    result = subprocess.run(
-        f'pybabel compile -d "{TRANSLATIONS_DIR}"',
-        stdout=subprocess.PIPE,
-        shell=True,
-    )
+    try:
+        cmd = f'"{sys.executable}" -m babel.messages.frontend compile -d "{TRANSLATIONS_DIR}"'
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+        )
 
-    if result.returncode != 0:
-        raise Exception(
-            f'Compiling translations failed:\n{result.stdout.decode()}')
+        if result.returncode != 0:
+            # Fallback to direct pybabel command if installed
+            result = subprocess.run(
+                f'pybabel compile -d "{TRANSLATIONS_DIR}"',
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True,
+            )
 
-    print('Translations compiled successfully')
+        if result.returncode == 0:
+            print('Translations compiled successfully')
+        else:
+            print(f"[Babel] Warning: Could not compile translations: {result.stderr.decode('utf-8', errors='ignore')}")
+    except Exception as e:
+        print(f"[Babel] Compilation note: {e}")

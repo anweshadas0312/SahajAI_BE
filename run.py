@@ -54,6 +54,28 @@ if __name__ == '__main__':
     # Register the blueprint
     app.register_blueprint(bp, url_prefix=url_prefix)
 
+    # Register modern Auth, Workspace, and Admin API blueprint
+    try:
+        from api_routes import api_bp
+        app.register_blueprint(api_bp)
+        print("[API] Successfully registered /api routes (auth, workspaces, admin)")
+    except Exception as e:
+        print(f"[API] Error loading api_routes: {e}")
+
+    # Enable CORS for frontend requests
+    try:
+        from flask_cors import CORS
+        CORS(app, resources={r"/*": {"origins": "*"}})
+    except Exception as e:
+        print(f"[CORS] Note: {e}")
+
+    # Initialize MySQL Database & Tables
+    try:
+        import db
+        db.init_db()
+    except Exception as dbe:
+        print(f"[DB] Database startup check: {dbe}")
+
     # Run the Flask server
     print(f"Running on {site_config['port']}{url_prefix}")
     app.run(**site_config)

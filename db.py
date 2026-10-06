@@ -391,10 +391,37 @@ def delete_conversation(conversation_id, user_id):
 
 
 # --- Message Operations ---
-def add_message(conversation_id, role, content):
+def add_message(conversation_id, role, content, workspace_id=None, user_id=None):
+    if not conversation_id or not content:
+        return None
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
+            # Check if conversation exists; if not, create it first
+            cursor.execute("SELECT id FROM conversations WHERE id = %s", (conversation_id,))
+            if not cursor.fetchone():
+                # Resolve user_id
+                uid = user_id
+                if not uid:
+                    cursor.execute("SELECT id FROM users LIMIT 1")
+                    u_row = cursor.fetchone()
+                    uid = u_row['id'] if u_row else 1
+
+                # Resolve workspace_id
+                ws_id = workspace_id
+                if not ws_id:
+                    cursor.execute("SELECT id FROM workspaces WHERE user_id = %s LIMIT 1", (uid,))
+                    ws_row = cursor.fetchone()
+                    ws_id = ws_row['id'] if ws_row else 1
+
+                title = (content[:32] + '...') if role == 'user' and len(content) > 32 else (content if role == 'user' else 'New Conversation')
+                cursor.execute(
+                    """INSERT INTO conversations (id, workspace_id, user_id, title)
+                       VALUES (%s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP""",
+                    (conversation_id, ws_id, uid, title)
+                )
+
             cursor.execute(
                 "INSERT INTO messages (conversation_id, role, content) VALUES (%s, %s, %s)",
                 (conversation_id, role, content)
