@@ -38,8 +38,9 @@ def get_languages():
 def compile_translations():
     """Compile the translation files."""
     result = subprocess.run(
-        ['pybabel', 'compile', '-d', TRANSLATIONS_DIR],
+        f'pybabel compile -d "{TRANSLATIONS_DIR}"',
         stdout=subprocess.PIPE,
+        shell=True,
     )
 
     if result.returncode != 0:
