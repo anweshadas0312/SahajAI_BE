@@ -480,24 +480,41 @@ def delete_file(file_id):
 def view_file_content(file_id):
     try:
         file_data = db.get_file_by_id(file_id)
-        if not file_data:
+        storage_path = file_data.get('storage_path') if file_data else None
+
+        # Fallback: Search uploads directory on disk if python restarted or DB memory store reset
+        if not storage_path or not os.path.exists(storage_path):
+            if os.path.exists(UPLOAD_DIR):
+                for f in os.listdir(UPLOAD_DIR):
+                    if f.startswith(file_id):
+                        storage_path = os.path.join(UPLOAD_DIR, f)
+                        break
+
+        if not storage_path or not os.path.exists(storage_path):
             return jsonify({'success': False, 'error': 'File not found'}), 404
 
-        storage_path = file_data.get('storage_path')
-        if not storage_path or not os.path.exists(storage_path):
-            return jsonify({'success': False, 'error': 'Physical file missing on server'}), 404
+        mime = 'application/octet-stream'
+        ext = os.path.splitext(storage_path)[1].lower()
+        if ext == '.pdf':
+            mime = 'application/pdf'
+        elif ext in ['.txt', '.py', '.js', '.ts', '.json', '.md', '.csv', '.sql', '.xml']:
+            mime = 'text/plain'
+        elif ext == '.html':
+            mime = 'text/html'
+        elif file_data and file_data.get('mime_type'):
+            mime = file_data['mime_type']
 
-        mime = file_data.get('mime_type') or 'application/octet-stream'
-        # For PDFs or images, inline view; otherwise download
         as_attachment = False if mime in ['application/pdf', 'text/plain', 'text/html', 'image/png', 'image/jpeg'] else True
+        download_name = file_data.get('original_name', os.path.basename(storage_path)) if file_data else os.path.basename(storage_path)
 
         return send_file(
             storage_path,
             mimetype=mime,
             as_attachment=as_attachment,
-            download_name=file_data.get('original_name', 'document')
+            download_name=download_name
         )
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 
