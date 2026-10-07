@@ -11,12 +11,14 @@ import db
 SECRET_KEY = "sahaj_ai_jwt_secret_key_change_in_production"
 
 
-def generate_token(user_id: int, role: str, expires_in_seconds: int = 604800) -> str:
+def generate_token(user_id: int, role: str, username: str = None, email: str = None, expires_in_seconds: int = 604800) -> str:
     """Generates a secure HMAC-SHA256 signed bearer token."""
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
         "sub": user_id,
         "role": role,
+        "username": username,
+        "email": email,
         "exp": int(time.time()) + expires_in_seconds,
         "iat": int(time.time())
     }
@@ -102,8 +104,8 @@ def token_required(f):
         if not user:
             user = {
                 "id": payload.get("sub", 1),
-                "username": "user",
-                "email": "user@sahaj.ai",
+                "username": payload.get("username") or "user",
+                "email": payload.get("email") or "user@sahaj.ai",
                 "role": payload.get("role", "user")
             }
 

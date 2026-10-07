@@ -46,33 +46,62 @@ class Backend_Api:
 
             # Generate response
             def local_llm_stream():
-                import json, requests
-                from config import api_url
+                import json, requests, db
+
+                providers = db.get_all_llm_providers()
+
+                # 1. Try matching requested model if active
+                target_provider = next((p for p in providers if p.get('model_name') == model and p.get('is_active')), None)
+
+                # 2. Fallback to any active provider if requested model is inactive/not found
+                if not target_provider:
+                    target_provider = next((p for p in providers if p.get('is_active')), None)
+
+                # 3. If NO provider is active in the database
+                if not target_provider:
+                    err_msg = f"⚠️ [System Alert]: All AI models are currently turned OFF (inactive) in System Configuration. Please enable at least one LLM Provider in Admin Settings to resume chat."
+                    yield err_msg
+                    if conversation_id:
+                        try:
+                            db.add_message(conversation_id, 'assistant', err_msg, workspace_id=workspace_id)
+                        except Exception as dbe:
+                            print(f"[DB] Note: {dbe}")
+                    return
+
+                api_url = target_provider.get('endpoint') or 'http://122.163.121.176:3041/v1/chat/completions'
+                actual_model = target_provider.get('model_name', model)
+                timeout_val = target_provider.get('timeout', 600)
+
                 payload = {
-                    "model": model,
+                    "model": actual_model,
                     "messages": messages,
                     "stream": True
                 }
                 assistant_accumulated = []
                 try:
-                    with requests.post(api_url, json=payload, stream=True, timeout=(20, 300)) as r:
-                        for line in r.iter_lines():
-                            if line:
-                                line = line.decode('utf-8')
-                                if line.startswith('data: '):
-                                    data = line[6:]
-                                    if data == '[DONE]':
-                                        break
-                                    try:
-                                        chunk = json.loads(data)
-                                        content = chunk['choices'][0].get('delta', {}).get('content', '')
-                                        if content:
-                                            assistant_accumulated.append(content)
-                                            yield content
-                                    except json.JSONDecodeError:
-                                        pass
+                    with requests.post(api_url, json=payload, stream=True, timeout=(10, timeout_val)) as r:
+                        if r.status_code >= 400:
+                            err_msg = f"⚠️ [LLM Service Error]: Endpoint returned HTTP {r.status_code}"
+                            assistant_accumulated.append(err_msg)
+                            yield err_msg
+                        else:
+                            for line in r.iter_lines():
+                                if line:
+                                    line = line.decode('utf-8')
+                                    if line.startswith('data: '):
+                                        data = line[6:]
+                                        if data == '[DONE]':
+                                            break
+                                        try:
+                                            chunk = json.loads(data)
+                                            content = chunk['choices'][0].get('delta', {}).get('content', '')
+                                            if content:
+                                                assistant_accumulated.append(content)
+                                                yield content
+                                        except json.JSONDecodeError:
+                                            pass
                 except Exception as req_err:
-                    err_msg = f"\n[LLM Service Note: {str(req_err)}]"
+                    err_msg = f"⚠️ [LLM Connection Failed]: Cannot reach endpoint '{api_url}' ({str(req_err)})"
                     assistant_accumulated.append(err_msg)
                     yield err_msg
 
@@ -143,7 +172,10 @@ def build_messages(jailbreak):
     if active_file_ids and user_prompt_text:
         try:
             import rag_engine
-            results, max_sim = rag_engine.retrieve_relevant_chunks(active_file_ids, user_prompt_text, top_k=4)
+            top_k_count = min(12, max(6, len(active_file_ids) * 3))
+            results, max_sim = rag_engine.retrieve_relevant_chunks(
+                active_file_ids, user_prompt_text, top_k=top_k_count, min_similarity=0.08
+            )
             if results:
                 file_context_msg = rag_engine.format_context_block(results)
                 conversation.insert(0, {'role': 'system', 'content': file_context_msg})

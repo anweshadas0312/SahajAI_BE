@@ -194,6 +194,77 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
+            # System Configs Table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS system_configs (
+                    key_name VARCHAR(100) PRIMARY KEY,
+                    key_value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+
+            # LLM Providers Table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS llm_providers (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(150) NOT NULL,
+                    provider_type VARCHAR(50) NOT NULL,
+                    model_name VARCHAR(150) NOT NULL,
+                    endpoint VARCHAR(512) DEFAULT NULL,
+                    api_key VARCHAR(512) DEFAULT NULL,
+                    timeout INT DEFAULT 600,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+
+            # Seed system configs if empty
+            cursor.execute("SELECT COUNT(*) AS count FROM system_configs;")
+            cfg_count = cursor.fetchone()['count']
+            if cfg_count == 0:
+                default_configs = [
+                    ('llm_api_url', 'http://122.163.121.176:3041/v1/chat/completions'),
+                    ('default_model', 'mistral:latest'),
+                    ('secondary_model', 'qwen2.5-coder:1.5b'),
+                    ('streaming_protocol', 'Server-Sent Events (SSE)')
+                ]
+                cursor.executemany(
+                    "INSERT IGNORE INTO system_configs (key_name, key_value) VALUES (%s, %s)",
+                    default_configs
+                )
+
+            # Clean and sync llm_providers table (keep only actual models mistral:latest and qwen2.5-coder:1.5b)
+            cursor.execute("DELETE FROM llm_providers WHERE model_name NOT IN ('mistral:latest', 'qwen2.5-coder:1.5b');")
+
+            # Check and insert mistral:latest
+            cursor.execute("SELECT id FROM llm_providers WHERE model_name = 'mistral:latest';")
+            row_mistral = cursor.fetchone()
+            if not row_mistral:
+                cursor.execute(
+                    "INSERT INTO llm_providers (name, provider_type, model_name, endpoint, api_key, timeout, is_active) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    ("Mistral Local", "Mistral", "mistral:latest", "http://122.163.121.176:3041/v1/chat/completions", "NA", 600, True)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE llm_providers SET endpoint = %s, provider_type = %s, name = %s WHERE model_name = %s",
+                    ("http://122.163.121.176:3041/v1/chat/completions", "Mistral", "Mistral Local", "mistral:latest")
+                )
+
+            # Check and insert qwen2.5-coder:1.5b
+            cursor.execute("SELECT id FROM llm_providers WHERE model_name = 'qwen2.5-coder:1.5b';")
+            row_qwen = cursor.fetchone()
+            if not row_qwen:
+                cursor.execute(
+                    "INSERT INTO llm_providers (name, provider_type, model_name, endpoint, api_key, timeout, is_active) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    ("Qwen Coder Local", "Qwen", "qwen2.5-coder:1.5b", "http://122.163.121.176:3041/v1/chat/completions", "NA", 600, True)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE llm_providers SET endpoint = %s, provider_type = %s, name = %s WHERE model_name = %s",
+                    ("http://122.163.121.176:3041/v1/chat/completions", "Qwen", "Qwen Coder Local", "qwen2.5-coder:1.5b")
+                )
+
 
             # Step 3: Seed initial users if empty
             cursor.execute("SELECT COUNT(*) AS count FROM users;")
@@ -777,5 +848,197 @@ def delete_file_record(file_id, user_id):
         return True
 
     return False
+
+
+# --- System Configuration Operations ---
+MEMORY_SYSTEM_CONFIGS = {
+    'llm_api_url': 'http://122.163.121.176:3041/v1/chat/completions',
+    'default_model': 'mistral:latest',
+    'secondary_model': 'qwen2.5-coder:1.5b',
+    'streaming_protocol': 'Server-Sent Events (SSE)'
+}
+
+
+def get_all_system_configs():
+    configs = dict(MEMORY_SYSTEM_CONFIGS)
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT key_name, key_value FROM system_configs")
+            rows = cursor.fetchall()
+            conn.close()
+            for row in rows:
+                configs[row['key_name']] = row['key_value']
+            return configs
+    except Exception as e:
+        print(f"[DB] system_configs fetch note: {e}")
+        return configs
+
+
+def get_system_config(key_name, default_val=None):
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT key_value FROM system_configs WHERE key_name = %s", (key_name,))
+            row = cursor.fetchone()
+            conn.close()
+            if row and row.get('key_value'):
+                return row['key_value']
+    except Exception:
+        pass
+    return MEMORY_SYSTEM_CONFIGS.get(key_name, default_val)
+
+
+def set_system_config(key_name, key_value):
+    MEMORY_SYSTEM_CONFIGS[key_name] = key_value
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO system_configs (key_name, key_value)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE key_value = VALUES(key_value);
+            """, (key_name, key_value))
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[DB] system_config set note: {e}")
+        return False
+
+
+# --- LLM Provider Management Operations ---
+_MEM_LLM_PROVIDERS = [
+    {
+        "id": 1,
+        "name": "Mistral Local",
+        "provider_type": "Mistral",
+        "model_name": "mistral:latest",
+        "endpoint": "http://122.163.121.176:3041/v1/chat/completions",
+        "api_key": "NA",
+        "timeout": 600,
+        "is_active": True
+    },
+    {
+        "id": 2,
+        "name": "Qwen Coder Local",
+        "provider_type": "Qwen",
+        "model_name": "qwen2.5-coder:1.5b",
+        "endpoint": "http://122.163.121.176:3041/v1/chat/completions",
+        "api_key": "NA",
+        "timeout": 600,
+        "is_active": True
+    }
+]
+
+
+def get_all_llm_providers():
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, name, provider_type, model_name, endpoint, api_key, timeout, is_active, created_at, updated_at FROM llm_providers ORDER BY id ASC")
+            rows = cursor.fetchall()
+            conn.close()
+            if rows:
+                for r in rows:
+                    r['is_active'] = bool(r['is_active'])
+                return rows
+    except Exception as e:
+        print(f"[DB] llm_providers fetch note: {e}")
+    return list(_MEM_LLM_PROVIDERS)
+
+
+def add_llm_provider(name, provider_type, model_name, endpoint="", api_key="", timeout=600, is_active=True):
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO llm_providers (name, provider_type, model_name, endpoint, api_key, timeout, is_active) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (name, provider_type, model_name, endpoint, api_key, timeout, is_active)
+            )
+            pid = cursor.lastrowid
+            conn.close()
+            return pid
+    except Exception as e:
+        print(f"[DB] add_llm_provider note: {e}")
+
+    new_id = (max([p['id'] for p in _MEM_LLM_PROVIDERS] or [0])) + 1
+    new_p = {
+        "id": new_id,
+        "name": name,
+        "provider_type": provider_type,
+        "model_name": model_name,
+        "endpoint": endpoint,
+        "api_key": api_key,
+        "timeout": timeout,
+        "is_active": is_active
+    }
+    _MEM_LLM_PROVIDERS.append(new_p)
+    return new_id
+
+
+def update_llm_provider(provider_id, name, provider_type, model_name, endpoint="", api_key="", timeout=600, is_active=True):
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            if api_key and not api_key.startswith("••••") and not api_key.startswith("mstr***") and not api_key.startswith("AQ.A***"):
+                cursor.execute(
+                    "UPDATE llm_providers SET name=%s, provider_type=%s, model_name=%s, endpoint=%s, api_key=%s, timeout=%s, is_active=%s WHERE id=%s",
+                    (name, provider_type, model_name, endpoint, api_key, timeout, is_active, provider_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE llm_providers SET name=%s, provider_type=%s, model_name=%s, endpoint=%s, timeout=%s, is_active=%s WHERE id=%s",
+                    (name, provider_type, model_name, endpoint, timeout, is_active, provider_id)
+                )
+            conn.close()
+            return True
+    except Exception as e:
+        print(f"[DB] update_llm_provider note: {e}")
+
+    for p in _MEM_LLM_PROVIDERS:
+        if p['id'] == int(provider_id):
+            p['name'] = name
+            p['provider_type'] = provider_type
+            p['model_name'] = model_name
+            p['endpoint'] = endpoint
+            if api_key and not api_key.startswith("••••") and not api_key.startswith("mstr***") and not api_key.startswith("AQ.A***"):
+                p['api_key'] = api_key
+            p['timeout'] = timeout
+            p['is_active'] = is_active
+            return True
+    return False
+
+
+def delete_llm_provider(provider_id):
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM llm_providers WHERE id = %s", (provider_id,))
+            conn.close()
+            return True
+    except Exception as e:
+        print(f"[DB] delete_llm_provider note: {e}")
+
+    global _MEM_LLM_PROVIDERS
+    _MEM_LLM_PROVIDERS = [p for p in _MEM_LLM_PROVIDERS if p['id'] != int(provider_id)]
+    return True
+
+
+def toggle_llm_provider_status(provider_id, is_active):
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE llm_providers SET is_active = %s WHERE id = %s", (is_active, provider_id))
+            conn.close()
+            return True
+    except Exception as e:
+        print(f"[DB] toggle_llm_provider_status note: {e}")
+
+    for p in _MEM_LLM_PROVIDERS:
+        if p['id'] == int(provider_id):
+            p['is_active'] = is_active
+            return True
+    return False
+
 
 

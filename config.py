@@ -1,12 +1,12 @@
 import os
 
-api_url = "http://122.163.121.176:3041/v1/chat/completions"
+# api_url = "http://122.163.121.176:3041/v1/chat/completions"
 google_client_id = os.getenv("GOOGLE_CLIENT_ID", "754929770183-m5p32a7dl7asj2vlmonums5upv5st2rp.apps.googleusercontent.com")
 
-models = [
-    'mistral:latest',
-    'qwen2.5-coder:1.5b',
-]
+# models = [
+#     'mistral:latest',
+#     'qwen2.5-coder:1.5b',
+# ]
 
 special_instructions = {
     'default': [],
