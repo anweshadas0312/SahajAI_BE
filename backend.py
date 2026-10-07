@@ -198,6 +198,28 @@ def build_messages(jailbreak):
         search_results = fetch_search_results(query)
         conversation.extend(search_results)
 
+    # Chart instruction prompt to ensure LLM generates structured ```chart JSON ONLY when requested
+    chart_keywords = ['chart', 'pie', 'bar', 'graph', 'plot', 'visual', 'diagram', 'barchart', 'piechart', 'চার্ট', 'গ্রাফ', 'পাই চার্ট', 'বার চার্ট']
+    user_wants_chart = any(kw in user_prompt_text.lower() for kw in chart_keywords)
+
+    chart_prompt_guidelines = (
+        "\n\n[USER EXPLICITLY REQUESTED A CHART]:\n"
+        "The user wants a data chart/visualization (Pie chart, Bar chart, Line chart).\n"
+        "You MUST output a valid ```chart codeblock containing JSON data extracted from the document/input so the frontend can render an interactive Pie/Bar chart.\n"
+        "Required JSON Format:\n"
+        "```chart\n"
+        "{\n"
+        '  "type": "pie",\n'
+        '  "title": "Clear Title Describing The Chart Data",\n'
+        '  "data": [\n'
+        '    {"name": "Category Name 1", "value": 150},\n'
+        '    {"name": "Category Name 2", "value": 230}\n'
+        '  ]\n'
+        "}\n"
+        "```\n"
+        "Use type 'pie' for proportional breakdown or 'bar' for comparison. Also provide a helpful textual explanation."
+    )
+
     # Build final user prompt with file context embedded directly
     final_prompt_content = user_prompt_text
     if file_context_msg:
@@ -206,7 +228,35 @@ def build_messages(jailbreak):
         else:
             final_prompt_content = f"{file_context_msg}\n\nPlease analyze and summarize the attached document."
 
+    # If user wants a chart, append strict mandatory instruction at the very end of prompt asking to start with ```chart
+    if user_wants_chart:
+        chart_mandatory_rule = (
+            "\n\n[MANDATORY SYSTEM DIRECTIVE FOR VISUAL CHART]:\n"
+            "The user explicitly requested a visual Pie chart / Bar chart.\n"
+            "YOU MUST START YOUR RESPONSE DIRECTLY WITH A ```chart JSON CODE BLOCK AS THE VERY FIRST ITEM IN YOUR OUTPUT.\n\n"
+            "Required Format:\n"
+            "```chart\n"
+            "{\n"
+            '  "type": "pie",\n'
+            '  "title": "Category Sales / Market Share Breakdown",\n'
+            '  "data": [\n'
+            '    {"name": "Gold", "value": 22956},\n'
+            '    {"name": "Silver", "value": 3308}\n'
+            '  ]\n'
+            "}\n"
+            "```\n"
+            "Calculate actual numerical totals/percentages from the file. DO NOT write text before the ```chart block. START WITH ```chart IMMEDIATELY."
+        )
+        final_prompt_content = final_prompt_content + chart_mandatory_rule
+
     conversation.append({'role': 'user', 'content': final_prompt_content})
+
+    # Add system message at beginning of conversation array if user requested chart
+    if user_wants_chart:
+        conversation.insert(0, {
+            'role': 'system',
+            'content': 'You are an expert AI data assistant. Whenever the user requests a chart, pie chart, or bar chart, you MUST output a ```chart JSON code block as the very first output.'
+        })
 
     return conversation
 
