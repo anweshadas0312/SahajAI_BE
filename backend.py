@@ -212,28 +212,46 @@ def fetch_search_results(query):
     :return: List of search results  
     """
     try:
-        from ddgs import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+
+        results = []
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
-        
+
+        # Fallback without date prefix if initial query returned nothing
+        if not results:
+            clean_q = re.sub(r'^Current date: \d{4}-\d{2}-\d{2}\.\s*', '', query)
+            with DDGS() as ddgs:
+                results = list(ddgs.text(clean_q, max_results=5))
+
+        if not results:
+            return []
+
         snippets = ""
         for index, result in enumerate(results):
-            snippet = f'[{index + 1}] "{result.get("body", "")}" URL:{result.get("href", "")}\n'
-            snippets += snippet
+            body = result.get("body", "")
+            href = result.get("href", "")
+            title = result.get("title", "")
+            if body or href:
+                snippets += f'[{index + 1}] "{body}" Source: {title} URL:{href}\n'
+
+        if not snippets.strip():
+            return []
 
         response = (
-            "Here are the latest web search results:\n"
+            "Here are the latest web search results for context:\n"
             f"{snippets}\n"
-            "Instructions: Use ONLY the information provided in these search results to answer the user's query. "
-            "Do not hallucinate or make up dates/information that are not explicitly stated in the snippets. "
-            "If the snippets do not contain the complete answer, say so. "
-            "IMPORTANT: At the end of your answer, you MUST list the source URLs from the snippets as References. "
-            "You MUST format these references as Markdown clickable links, like this: [Website Name](URL)."
+            "Instructions: Use the above search results along with your knowledge to give an up-to-date and accurate answer. "
+            "Cite the source URLs at the end as clickable Markdown links, for example: [Website Name](URL)."
         )
 
         return [{'role': 'system', 'content': response}]
     except Exception as e:
-        return [{'role': 'system', 'content': 'Note: Real-time web search is currently broken because the search API is offline. Answer using your existing knowledge only.'}]
+        print(f"[Web Search Warning] {e}")
+        return []
 
 
 def generate_stream(response, jailbreak):
