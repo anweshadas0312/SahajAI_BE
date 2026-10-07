@@ -649,17 +649,6 @@ def admin_all_workspaces():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@api_bp.route('/db/status', methods=['GET'])
-def get_db_status():
-    """Endpoint to check database connection status."""
-    try:
-        conn = db.get_connection()
-        conn.close()
-        return jsonify({'connected': True, 'type': 'MySQL', 'message': 'MySQL connected successfully'})
-    except Exception as e:
-        return jsonify({'connected': False, 'type': 'MySQL', 'error': str(e)}), 200
-
-
 # ==========================================
 # FILE INTELLIGENCE ENDPOINTS
 # ==========================================
@@ -668,7 +657,7 @@ ALLOWED_EXTENSIONS = {
     '.pdf', '.docx', '.txt', '.md', '.csv', '.xlsx', '.xls',
     '.py', '.js', '.ts', '.jsx', '.tsx', '.json', '.html', '.css', '.sql', '.xml'
 }
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB cap
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB cap
 
 import os, uuid
 import rag_engine
@@ -700,7 +689,7 @@ def upload_file():
     uploaded_file.seek(0)
 
     if file_size > MAX_FILE_SIZE:
-        return jsonify({'success': False, 'error': 'File size exceeds maximum limit of 25 MB'}), 400
+        return jsonify({'success': False, 'error': 'File size exceeds maximum limit of 2 MB'}), 400
 
     workspace_id = request.form.get('workspace_id')
     conversation_id = request.form.get('conversation_id')

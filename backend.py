@@ -165,22 +165,31 @@ def build_messages(jailbreak):
         except Exception as e:
             print(f"[Backend] Error fetching conversation files: {e}")
 
-    # Add the existing conversation
-    conversation = list(_conversation)
-
-    # RAG File Retrieval if files attached
-    if active_file_ids and user_prompt_text:
+    # Retrieve RAG file context if any files are active
+    file_context_msg = ""
+    if active_file_ids:
         try:
             import rag_engine
-            top_k_count = min(12, max(6, len(active_file_ids) * 3))
-            results, max_sim = rag_engine.retrieve_relevant_chunks(
-                active_file_ids, user_prompt_text, top_k=top_k_count, min_similarity=0.08
-            )
+            query_for_rag = user_prompt_text.strip() if user_prompt_text else "Summarize and analyze the attached document."
+            results = rag_engine.retrieve_file_context(active_file_ids, query_for_rag)
             if results:
                 file_context_msg = rag_engine.format_context_block(results)
-                conversation.insert(0, {'role': 'system', 'content': file_context_msg})
         except Exception as rage:
             print(f"[RAG Engine Warning]: {rage}")
+
+    # Slice past conversation history first (keep up to last 6 messages)
+    history = list(_conversation)
+    if len(history) > 6:
+        history = history[-6:]
+
+    conversation = []
+
+    # Add jailbreak instructions if enabled
+    if jailbreak_instructions := getJailbreak(jailbreak):
+        conversation.extend(jailbreak_instructions)
+
+    # Add past history
+    conversation.extend(history)
 
     # Add web results if enabled
     if internet_access:
@@ -189,16 +198,15 @@ def build_messages(jailbreak):
         search_results = fetch_search_results(query)
         conversation.extend(search_results)
 
-    # Add jailbreak instructions if enabled
-    if jailbreak_instructions := getJailbreak(jailbreak):
-        conversation.extend(jailbreak_instructions)
+    # Build final user prompt with file context embedded directly
+    final_prompt_content = user_prompt_text
+    if file_context_msg:
+        if user_prompt_text and user_prompt_text.strip() != "Summarize and analyze the attached document.":
+            final_prompt_content = f"{file_context_msg}\n\nUser Question/Instruction:\n{user_prompt_text}"
+        else:
+            final_prompt_content = f"{file_context_msg}\n\nPlease analyze and summarize the attached document."
 
-    # Add the prompt
-    conversation.append(prompt)
-
-    # Reduce conversation size to avoid API Token quantity error
-    if len(conversation) > 5:
-        conversation = conversation[-5:]
+    conversation.append({'role': 'user', 'content': final_prompt_content})
 
     return conversation
 

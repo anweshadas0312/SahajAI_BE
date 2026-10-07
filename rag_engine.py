@@ -154,6 +154,46 @@ def process_and_store_file(file_id, file_path, mime_type, original_name):
         return False
 
 
+def retrieve_file_context(file_ids, query=""):
+    """
+    Retrieves full content or top relevant chunks for specified file_ids.
+    - For summary queries or short files: returns all sequential chunks.
+    - For specific queries: combines document header/intro chunks with top vector search results.
+    """
+    if not file_ids:
+        return []
+
+    all_chunks = db.get_chunks_by_file_ids(file_ids)
+    if not all_chunks:
+        return []
+
+    query_lower = query.lower().strip()
+    summary_keywords = ['summary', 'summarize', 'overview', 'analyze', 'about', 'what is in', 'content', 'explain', 'detail', 'topic']
+    is_summary_request = not query_lower or any(kw in query_lower for kw in summary_keywords) or len(query_lower) < 15
+
+    # If small/medium document (<= 35 chunks) or summary request: return all sequential chunks
+    if is_summary_request or len(all_chunks) <= 35:
+        all_chunks_sorted = sorted(all_chunks, key=lambda c: (c.get('file_id', ''), c.get('chunk_index', 0)))
+        return [{'chunk': c, 'similarity': 1.0} for c in all_chunks_sorted[:40]]
+
+    # For specific questions in larger files:
+    # 1. Always include header chunks (title / intro)
+    header_chunks = all_chunks[:2]
+    header_chunk_ids = {c.get('id') for c in header_chunks}
+
+    # 2. Perform vector search for query
+    q_emb = compute_embedding(query)
+    search_results = vector_store.search(file_ids, q_emb, top_k=10)
+
+    # 3. Combine header chunks + top search results
+    final_results = [{'chunk': c, 'similarity': 1.0} for c in header_chunks]
+    for res in search_results:
+        if res['chunk'].get('id') not in header_chunk_ids:
+            final_results.append(res)
+
+    return final_results
+
+
 def retrieve_relevant_chunks(file_ids, query, top_k=4, min_similarity=0.15):
     """
     Retrieves Top-K relevant chunks for a query across specified file_ids.
@@ -176,14 +216,16 @@ def retrieve_relevant_chunks(file_ids, query, top_k=4, min_similarity=0.15):
 
 def format_context_block(retrieved_results):
     """
-    Formats retrieved chunks into a clean prompt context block with citations.
+    Formats retrieved chunks into a clean prompt context block with citations and clear AI instructions.
     """
     if not retrieved_results:
         return ""
 
-    context_str = "Below are relevant extracts from the attached file(s) for this conversation:\n\n"
+    context_str = "================ ATTACHED DOCUMENT CONTENT ================\n"
+    context_str += "The user has uploaded document(s). Below is the actual extracted content from the uploaded file(s):\n\n"
+    
     for idx, item in enumerate(retrieved_results, 1):
-        chunk = item['chunk']
+        chunk = item.get('chunk', item)
         filename = chunk.get('original_name', 'Attached Document')
         location_meta = []
         
@@ -196,10 +238,16 @@ def format_context_block(retrieved_results):
             
         loc_str = f" ({', '.join(location_meta)})" if location_meta else ""
 
-        context_str += f"--- Source [{idx}]: {filename}{loc_str} ---\n"
+        context_str += f"--- Document Section [{idx}]: {filename}{loc_str} ---\n"
         context_str += f"{chunk['content']}\n\n"
 
-    context_str += "Instructions: Base your answer primarily on these file extracts when answering questions about the file. "
-    context_str += "If the question is about the file but the extracts do not contain the answer, explicitly state that the uploaded document does not contain that information."
+    context_str += "============================================================\n"
+    context_str += "CRITICAL INSTRUCTIONS FOR AI:\n"
+    context_str += "1. Analyze the document content above thoroughly.\n"
+    context_str += "2. If the user uploaded the file without a prompt, or asked for a summary/overview: Provide a comprehensive, well-structured summary including:\n"
+    context_str += "   - 📄 **File Overview & Purpose**: What the file is and its main goal.\n"
+    context_str += "   - 📌 **Key Topics & Core Content**: Detailed breakdown of sections, data, or arguments.\n"
+    context_str += "   - 💡 **Key Takeaways & Highlights**: Important points, conclusions, or figures.\n"
+    context_str += "3. If the user asked a specific query: Answer accurately based strictly on the extracted text above.\n"
 
     return context_str

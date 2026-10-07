@@ -1,6 +1,23 @@
 import os
 import re
 
+# Pre-load parsing libraries at startup for maximum upload speed
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
+
+
 def parse_file(file_path, mime_type, original_name):
     """
     Parses a file and returns a list of raw segment dicts:
@@ -30,8 +47,9 @@ def parse_file(file_path, mime_type, original_name):
 
 def _parse_pdf(file_path):
     segments = []
+    if not PyPDF2:
+        return segments
     try:
-        import PyPDF2
         reader = PyPDF2.PdfReader(file_path)
         for page_idx, page in enumerate(reader.pages):
             text = page.extract_text() or ''
@@ -51,8 +69,9 @@ def _parse_pdf(file_path):
 
 def _parse_docx(file_path):
     segments = []
+    if not docx:
+        return segments
     try:
-        import docx
         doc = docx.Document(file_path)
         current_block = []
         current_line_count = 0
@@ -87,8 +106,9 @@ def _parse_docx(file_path):
 
 def _parse_excel_csv(file_path, ext):
     segments = []
+    if pd is None:
+        return segments
     try:
-        import pandas as pd
         if ext == '.csv':
             df = pd.read_csv(file_path)
             sheets = {'CSV_Data': df}
