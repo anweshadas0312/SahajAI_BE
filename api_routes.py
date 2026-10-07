@@ -105,7 +105,9 @@ def google_auth():
         id_info = None
         # Try google.oauth2 id_token verification first
         try:
+            # pyrefly: ignore [missing-import]
             from google.oauth2 import id_token
+            # pyrefly: ignore [missing-import]
             from google.auth.transport import requests as google_requests
             id_info = id_token.verify_oauth2_token(
                 token, google_requests.Request(), GOOGLE_CLIENT_ID
