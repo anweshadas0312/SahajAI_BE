@@ -292,8 +292,11 @@ def init_db():
                 regular_user_id = cursor.lastrowid
                 cursor.execute(
                     "INSERT INTO workspaces (user_id, name, description, is_default, icon_color) VALUES (%s, %s, %s, %s, %s)",
-                    (regular_user_id, "Sahaj Workspace", "General workspace for daily inquiries", True, "#FACC15")
+                    (regular_user_id, "Default Workspace", "General workspace for daily inquiries", True, "#FACC15")
                 )
+
+            # Migration: Update existing workspaces named 'Sahaj Workspace' to 'Default Workspace'
+            cursor.execute("UPDATE workspaces SET name = 'Default Workspace' WHERE name = 'Sahaj Workspace';")
 
         conn.close()
         print(f"[DB] MySQL database `{db_name}` initialized successfully.")
@@ -336,7 +339,7 @@ def create_user(username, email, password_hash=None, role='user', auth_provider=
             # Automatically create a default workspace
             cursor.execute(
                 "INSERT INTO workspaces (user_id, name, description, is_default, icon_color) VALUES (%s, %s, %s, %s, %s)",
-                (user_id, "Sahaj Workspace", "Personal AI Workspace", True, "#FACC15")
+                (user_id, "Default Workspace", "Personal AI Workspace", True, "#FACC15")
             )
             return user_id
     finally:
