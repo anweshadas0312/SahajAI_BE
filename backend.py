@@ -1,15 +1,18 @@
-import re
-from datetime import datetime
-# from g4f import ChatCompletion
 import json
-import requests
-from flask import request, Response, stream_with_context
-from requests import get
-from config import special_instructions
-import guardrails
-
-
 import random
+import re
+import time
+from datetime import datetime
+
+import requests
+from flask import Response, request, stream_with_context
+from requests import get
+
+import config
+from config import special_instructions
+import db
+import guardrails
+import rag_engine
 
 
 def get_dynamic_status(stage: str, prompt_text: str = "", context: dict = None) -> str:
@@ -147,6 +150,50 @@ def get_dynamic_status(stage: str, prompt_text: str = "", context: dict = None) 
     return "Thinking..."
 
 
+def get_failover_provider_candidates(requested_model=None):
+    """
+    Builds a prioritized list of provider configurations dynamically from the database.
+    - Candidate 1 (Primary): requested_model or db.get_system_config('default_model') or first active provider
+    - Candidate 2 (Fallback): db.get_system_config('fallback_model') from database (must be active)
+    Returns: list of provider dictionaries from database (zero hardcoding).
+    """
+    providers = db.get_all_llm_providers() or []
+    if not providers:
+        return []
+
+    default_model = db.get_system_config('default_model') or ''
+    fallback_model = db.get_system_config('fallback_model') or ''
+
+    primary_target = requested_model or default_model
+    candidates = []
+    seen_ids = set()
+
+    # 1. Primary candidate: match model_name with requested/default from active providers
+    primary_provider = None
+    if primary_target:
+        primary_provider = next((p for p in providers if p.get('model_name') == primary_target and p.get('is_active')), None)
+    # If not specifically matched, use first available active provider from database
+    if not primary_provider:
+        primary_provider = next((p for p in providers if p.get('is_active')), None)
+
+    if primary_provider:
+        candidates.append(primary_provider)
+        seen_ids.add(primary_provider.get('id'))
+
+    # 2. Designated Single Fallback candidate: match fallback_model from database and must be active
+    if fallback_model:
+        fallback_provider = next(
+            (p for p in providers if p.get('model_name') == fallback_model and p.get('is_active') and p.get('id') not in seen_ids),
+            None
+        )
+        if fallback_provider:
+            candidates.append(fallback_provider)
+            seen_ids.add(fallback_provider.get('id'))
+
+    # Strictly limit to Primary + 1 Fallback model only (no endless looping across other models)
+    return candidates
+
+
 class Backend_Api:
     def __init__(self, bp, config: dict) -> None:
         """
@@ -171,12 +218,13 @@ class Backend_Api:
         req_json = request.get_json(silent=True) or {}
         conversation_id = req_json.get('conversation_id', '')
         workspace_id = req_json.get('workspace_id')
-        jailbreak = req_json.get('jailbreak', 'default')
-        model = req_json.get('model', 'mistral:latest')
+        default_model = db.get_system_config('default_model') or ''
+        if not default_model:
+            first_active = next((p for p in db.get_all_llm_providers() if p.get('is_active')), None)
+            default_model = first_active.get('model_name') if first_active else ''
+        model = req_json.get('model') or default_model or 'mistral:latest'
 
         def pipeline_stream():
-            import db
-
             meta = req_json.get('meta', {})
             content_data = meta.get('content', {})
             _conv = content_data.get('conversation', [])
@@ -196,12 +244,9 @@ class Backend_Api:
                 except Exception as dbe:
                     print(f"[DB] Note: {dbe}")
 
-            # Resolve active LLM provider and model
-            providers = db.get_all_llm_providers()
-            target_provider = next((p for p in providers if p.get('model_name') == model and p.get('is_active')), None)
-            if not target_provider:
-                target_provider = next((p for p in providers if p.get('is_active')), None)
-            actual_model = target_provider.get('model_name', model) if target_provider else model
+            candidates = get_failover_provider_candidates(model)
+            primary_candidate = candidates[0] if candidates else None
+            actual_model = primary_candidate.get('model_name', model) if primary_candidate else model
 
             # Standard Mode Guardrails - Deterministic Identity Handler (Fast Path)
             if guardrails.is_standard_mode(jailbreak):
@@ -455,7 +500,7 @@ class Backend_Api:
             status_4 = get_dynamic_status('preparing_response', user_prompt_text)
             yield f"data: {json.dumps({'type': 'status', 'stage': 'preparing_response', 'text': status_4})}\n\n"
 
-            if not target_provider:
+            if not candidates:
                 err_msg = "⚠️ [System Alert]: All AI models are currently turned OFF (inactive) in System Configuration. Please enable at least one LLM Provider in Admin Settings to resume chat."
                 yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
                 if conversation_id:
@@ -465,29 +510,49 @@ class Backend_Api:
                         print(f"[DB] Note: {dbe}")
                 return
 
-            api_url = target_provider.get('endpoint') or 'http://122.163.121.176:3041/v1/chat/completions'
-            actual_model = target_provider.get('model_name', model)
-            timeout_val = target_provider.get('timeout', 600)
-
-            payload = {
-                "model": actual_model,
-                "messages": conversation,
-                "stream": True
-            }
+            success = False
             assistant_accumulated = []
 
-            try:
-                with requests.post(api_url, json=payload, stream=True, timeout=(10, timeout_val)) as r:
-                    if r.status_code >= 400:
-                        err_msg = f"⚠️ [LLM Service Error]: Endpoint returned HTTP {r.status_code}"
-                        assistant_accumulated.append(err_msg)
-                        yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
-                    else:
+            for idx, provider in enumerate(candidates):
+                api_url = provider.get('endpoint')
+                if not api_url:
+                    continue
+                actual_model = provider.get('model_name') or model
+                timeout_val = provider.get('timeout') or 600
+
+                status_prefix = "PRIMARY" if idx == 0 else "FALLBACK"
+                print(f"\n[LLM Request] >>> Trying {status_prefix} Model [{idx+1}/{len(candidates)}]: '{actual_model}' ({provider.get('name')}) | Endpoint: {api_url}")
+
+                if idx > 0:
+                    primary_label = candidates[0].get('name') or candidates[0].get('model_name')
+                    fallback_label = provider.get('name') or actual_model
+                    print(f"[LLM Failover] >>> Primary model ({primary_label}) failed. Switched to Fallback: '{fallback_label}'")
+                    notice = f"> ℹ️ *Note: Primary model ({primary_label}) did not respond. Continuing with fallback model ({fallback_label})...*\n\n"
+                    assistant_accumulated.append(notice)
+                    yield f"data: {json.dumps({'type': 'content', 'delta': notice})}\n\n"
+
+                payload = {
+                    "model": actual_model,
+                    "messages": conversation,
+                    "stream": True
+                }
+
+                try:
+                    conn_timeout = min(20, timeout_val)
+                    with requests.post(api_url, json=payload, stream=True, timeout=(conn_timeout, timeout_val)) as r:
+                        if r.status_code >= 400:
+                            print(f"[LLM Failover] >>> Model '{actual_model}' returned HTTP {r.status_code}. Trying next provider...")
+                            continue
+
+                        req_start = time.time()
+                        stream_received = False
                         is_std_chart = guardrails.is_standard_mode(jailbreak) and is_chart
                         chart_buffer = []
                         chart_validated = False
 
                         for line in r.iter_lines():
+                            if not stream_received and (time.time() - req_start > timeout_val):
+                                raise requests.exceptions.Timeout(f"Initial token generation exceeded timeout ({timeout_val}s)")
                             if line:
                                 line = line.decode('utf-8')
                                 if line.startswith('data: '):
@@ -499,6 +564,7 @@ class Backend_Api:
                                         content = chunk['choices'][0].get('delta', {}).get('content', '')
                                         if not content:
                                             continue
+                                        stream_received = True
 
                                         if is_std_chart and not chart_validated:
                                             chart_buffer.append(content)
@@ -516,7 +582,7 @@ class Backend_Api:
                                                 # Chart code block is complete, validate it
                                                 chart_validated = True
                                                 expected_c_type = chart_intent.get('chart_type') if 'chart_intent' in locals() else None
-                                                is_v, clean_text, payload, v_err = guardrails.validate_and_sanitize_chart_response(
+                                                is_v, clean_text, payload_res, v_err = guardrails.validate_and_sanitize_chart_response(
                                                     buf_str,
                                                     expected_chart_type=expected_c_type,
                                                     file_context=file_context_msg
@@ -535,7 +601,7 @@ class Backend_Api:
                             buf_str = "".join(chart_buffer)
                             if is_std_chart and not chart_validated:
                                 expected_c_type = chart_intent.get('chart_type') if 'chart_intent' in locals() else None
-                                is_v, clean_text, payload, v_err = guardrails.validate_and_sanitize_chart_response(
+                                is_v, clean_text, payload_res, v_err = guardrails.validate_and_sanitize_chart_response(
                                     buf_str,
                                     expected_chart_type=expected_c_type,
                                     file_context=file_context_msg
@@ -546,8 +612,18 @@ class Backend_Api:
                                 for c in chart_buffer:
                                     assistant_accumulated.append(c)
                                     yield f"data: {json.dumps({'type': 'content', 'delta': c})}\n\n"
-            except Exception as req_err:
-                err_msg = f"⚠️ [LLM Connection Failed]: Cannot reach endpoint '{api_url}' ({str(req_err)})"
+
+                        if stream_received:
+                            print(f"[LLM Response] <<< Successfully generated response using model: '{actual_model}' ({provider.get('name')})\n")
+                            success = True
+                            break
+
+                except Exception as req_err:
+                    print(f"[LLM Failover] >>> Model '{actual_model}' failed ({req_err}). Trying next candidate...")
+                    continue
+
+            if not success:
+                err_msg = "⚠️ [LLM Service Error]: All configured AI models are currently unreachable. Please verify network connectivity or check provider endpoints."
                 assistant_accumulated.append(err_msg)
                 yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
 
@@ -598,7 +674,6 @@ def build_messages(jailbreak):
     # Link payload file_ids to conversation if provided
     if conversation_id and payload_file_ids:
         try:
-            import db
             for fid in payload_file_ids:
                 db.link_file_to_conversation(conversation_id, fid)
         except Exception as e:
@@ -607,7 +682,6 @@ def build_messages(jailbreak):
     conv_files = []
     if conversation_id:
         try:
-            import db
             conv_files = db.get_conversation_files(conversation_id) or []
         except Exception as e:
             print(f"[Backend] Error fetching conversation files: {e}")
@@ -637,7 +711,6 @@ def build_messages(jailbreak):
     file_context_msg = ""
     if active_file_ids:
         try:
-            import rag_engine
             query_for_rag = user_prompt_text.strip() if user_prompt_text else "Summarize and analyze the attached document."
             results = rag_engine.retrieve_file_context(active_file_ids, query_for_rag)
             if results:
