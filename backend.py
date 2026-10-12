@@ -218,6 +218,7 @@ class Backend_Api:
         req_json = request.get_json(silent=True) or {}
         conversation_id = req_json.get('conversation_id', '')
         workspace_id = req_json.get('workspace_id')
+        jailbreak = req_json.get('jailbreak', 'default')
         default_model = db.get_system_config('default_model') or ''
         if not default_model:
             first_active = next((p for p in db.get_all_llm_providers() if p.get('is_active')), None)
