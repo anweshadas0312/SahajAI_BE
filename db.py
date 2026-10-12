@@ -234,35 +234,17 @@ def init_db():
                     default_configs
                 )
 
-            # Clean and sync llm_providers table (keep only actual models mistral:latest and qwen2.5-coder:1.5b)
-            cursor.execute("DELETE FROM llm_providers WHERE model_name NOT IN ('mistral:latest', 'qwen2.5-coder:1.5b');")
-
-            # Check and insert mistral:latest
-            cursor.execute("SELECT id FROM llm_providers WHERE model_name = 'mistral:latest';")
-            row_mistral = cursor.fetchone()
-            if not row_mistral:
+            # Seed initial llm_providers table ONLY if empty (preserves all custom/new models dynamically)
+            cursor.execute("SELECT COUNT(*) AS count FROM llm_providers;")
+            prov_count = cursor.fetchone()['count']
+            if prov_count == 0:
                 cursor.execute(
                     "INSERT INTO llm_providers (name, provider_type, model_name, endpoint, api_key, timeout, is_active) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    ("Mistral Local", "Mistral", "mistral:latest", "http://122.163.121.176:3041/v1/chat/completions", "NA", 600, True)
+                    ("Mistral Local", "Mistral", "mistral:latest", "http://122.163.121.176:3041/v1/chat/completions", "NA", 300, True)
                 )
-            else:
-                cursor.execute(
-                    "UPDATE llm_providers SET endpoint = %s, provider_type = %s, name = %s WHERE model_name = %s",
-                    ("http://122.163.121.176:3041/v1/chat/completions", "Mistral", "Mistral Local", "mistral:latest")
-                )
-
-            # Check and insert qwen2.5-coder:1.5b
-            cursor.execute("SELECT id FROM llm_providers WHERE model_name = 'qwen2.5-coder:1.5b';")
-            row_qwen = cursor.fetchone()
-            if not row_qwen:
                 cursor.execute(
                     "INSERT INTO llm_providers (name, provider_type, model_name, endpoint, api_key, timeout, is_active) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    ("Qwen Coder Local", "Qwen", "qwen2.5-coder:1.5b", "http://122.163.121.176:3041/v1/chat/completions", "NA", 600, True)
-                )
-            else:
-                cursor.execute(
-                    "UPDATE llm_providers SET endpoint = %s, provider_type = %s, name = %s WHERE model_name = %s",
-                    ("http://122.163.121.176:3041/v1/chat/completions", "Qwen", "Qwen Coder Local", "qwen2.5-coder:1.5b")
+                    ("Qwen Coder Local", "Qwen", "qwen2.5-coder:1.5b", "http://122.163.121.176:3041/v1/chat/completions", "NA", 30, True)
                 )
 
 

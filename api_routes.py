@@ -282,9 +282,28 @@ def update_system_config_route():
 @token_required
 def get_llm_providers_route():
     providers = db.get_all_llm_providers()
+    default_model = db.get_system_config('default_model') or ''
+    fallback_model = db.get_system_config('fallback_model') or ''
+
+    # Strict check: only active providers can hold default or fallback role
+    active_models = {p.get('model_name') for p in providers if p.get('is_active')}
+    if default_model and default_model not in active_models:
+        db.set_system_config('default_model', '')
+        default_model = ''
+    if fallback_model and fallback_model not in active_models:
+        db.set_system_config('fallback_model', '')
+        fallback_model = ''
+
+    for p in providers:
+        p_act = bool(p.get('is_active'))
+        p['is_default'] = bool(p_act and default_model and p.get('model_name') == default_model)
+        p['is_fallback'] = bool(p_act and fallback_model and p.get('model_name') == fallback_model)
+
     return jsonify({
         'success': True,
-        'providers': providers
+        'providers': providers,
+        'default_model': default_model,
+        'fallback_model': fallback_model
     })
 
 
@@ -361,15 +380,103 @@ def delete_llm_provider_route(provider_id):
 @api_bp.route('/admin/llm-providers/<int:provider_id>/toggle', methods=['PATCH'])
 @token_required
 def toggle_llm_provider_route(provider_id):
+    import config
     data = request.get_json() or {}
     is_active = bool(data.get('is_active', True))
+
+    # Validation: prevent deactivating if currently assigned as Primary or Fallback
+    if not is_active:
+        providers = db.get_all_llm_providers()
+        target = next((p for p in providers if p['id'] == provider_id), None)
+        if target:
+            target_model = target['model_name']
+            default_model = db.get_system_config('default_model') or ''
+            fallback_model = db.get_system_config('fallback_model') or ''
+            if target_model and target_model == default_model:
+                return jsonify({
+                    'success': False,
+                    'error': f"Cannot deactivate '{target.get('name')}': Currently assigned as PRIMARY LLM. Please assign another Primary LLM first."
+                }), 400
+            if target_model and target_model == fallback_model:
+                return jsonify({
+                    'success': False,
+                    'error': f"Cannot deactivate '{target.get('name')}': Currently assigned as FALLBACK LLM. Please assign another Fallback LLM first."
+                }), 400
+
     success = db.toggle_llm_provider_status(provider_id, is_active)
+
+    updated_providers = db.get_all_llm_providers()
+    default_model = db.get_system_config('default_model') or ''
+    fallback_model = db.get_system_config('fallback_model') or ''
+    for p in updated_providers:
+        p_act = bool(p.get('is_active'))
+        p['is_default'] = bool(p_act and default_model and p.get('model_name') == default_model)
+        p['is_fallback'] = bool(p_act and fallback_model and p.get('model_name') == fallback_model)
 
     return jsonify({
         'success': success,
         'message': f"Provider status updated to {'active' if is_active else 'inactive'}",
-        'providers': db.get_all_llm_providers()
+        'providers': updated_providers
     })
+
+
+@api_bp.route('/admin/llm-providers/<int:provider_id>/set-role', methods=['POST'])
+@token_required
+def set_provider_role_route(provider_id):
+    data = request.get_json() or {}
+    role = data.get('role')  # 'default' or 'fallback'
+    providers = db.get_all_llm_providers()
+    target = next((p for p in providers if p['id'] == provider_id), None)
+    if not target:
+        return jsonify({'success': False, 'error': 'Provider not found'}), 404
+
+    # Validation: cannot set role if is_active is 0/false
+    if not target.get('is_active'):
+        return jsonify({
+            'success': False,
+            'error': f"Cannot set '{target.get('name')}' as {role.upper()} LLM: Provider is currently inactive (is_active = 0). Please enable it first."
+        }), 400
+
+    target_model = target['model_name']
+    current_default = db.get_system_config('default_model') or ''
+    current_fallback = db.get_system_config('fallback_model') or ''
+
+    if role == 'default':
+        db.set_system_config('default_model', target_model)
+        # If target was previously the fallback model, swap so roles stay clean and distinct
+        if current_fallback == target_model:
+            other_prov = next((p for p in providers if p['model_name'] != target_model and p.get('is_active')), None)
+            new_fallback = current_default if (current_default != target_model) else (other_prov['model_name'] if other_prov else '')
+            db.set_system_config('fallback_model', new_fallback)
+    elif role == 'fallback':
+        db.set_system_config('fallback_model', target_model)
+        # If target was previously the default model, swap so roles stay clean and distinct
+        if current_default == target_model:
+            other_prov = next((p for p in providers if p['model_name'] != target_model and p.get('is_active')), None)
+            new_default = current_fallback if (current_fallback != target_model) else (other_prov['model_name'] if other_prov else '')
+            db.set_system_config('default_model', new_default)
+    else:
+        return jsonify({'success': False, 'error': f"Unknown role: {role}"}), 400
+
+    user = getattr(request, 'current_user', {})
+    if user.get('id'):
+        db.log_audit(user['id'], 'ADMIN_SET_LLM_ROLE', f"Set {target.get('name')} as {role.upper()} model ({target_model})")
+
+    default_model = db.get_system_config('default_model') or ''
+    fallback_model = db.get_system_config('fallback_model') or ''
+
+    for p in providers:
+        p['is_default'] = bool(default_model and p.get('model_name') == default_model)
+        p['is_fallback'] = bool(fallback_model and p.get('model_name') == fallback_model)
+
+    return jsonify({
+        'success': True,
+        'message': f"'{target.get('name')}' is now assigned as {role.upper()} LLM",
+        'providers': providers,
+        'default_model': default_model,
+        'fallback_model': fallback_model
+    })
+
 
 
 @api_bp.route('/admin/llm-providers/<int:provider_id>/test', methods=['POST'])
