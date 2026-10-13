@@ -384,7 +384,7 @@ def toggle_llm_provider_route(provider_id):
     data = request.get_json() or {}
     is_active = bool(data.get('is_active', True))
 
-    # Validation: prevent deactivating if currently assigned as Primary or Fallback
+    # Validation: prevent deactivating if currently assigned as Primary
     if not is_active:
         providers = db.get_all_llm_providers()
         target = next((p for p in providers if p['id'] == provider_id), None)
@@ -398,10 +398,8 @@ def toggle_llm_provider_route(provider_id):
                     'error': f"Cannot deactivate '{target.get('name')}': Currently assigned as PRIMARY LLM. Please assign another Primary LLM first."
                 }), 400
             if target_model and target_model == fallback_model:
-                return jsonify({
-                    'success': False,
-                    'error': f"Cannot deactivate '{target.get('name')}': Currently assigned as FALLBACK LLM. Please assign another Fallback LLM first."
-                }), 400
+                # Fallback role is optional: automatically unassign if deactivated
+                db.set_system_config('fallback_model', '')
 
     success = db.toggle_llm_provider_status(provider_id, is_active)
 
@@ -424,14 +422,14 @@ def toggle_llm_provider_route(provider_id):
 @token_required
 def set_provider_role_route(provider_id):
     data = request.get_json() or {}
-    role = data.get('role')  # 'default' or 'fallback'
+    role = data.get('role')  # 'default', 'fallback', or 'remove_fallback' / 'none'
     providers = db.get_all_llm_providers()
     target = next((p for p in providers if p['id'] == provider_id), None)
     if not target:
         return jsonify({'success': False, 'error': 'Provider not found'}), 404
 
-    # Validation: cannot set role if is_active is 0/false
-    if not target.get('is_active'):
+    # Validation: cannot set active role if is_active is 0/false (unassigning is always allowed)
+    if role not in ('remove_fallback', 'unset_fallback', 'clear_fallback', 'none') and not target.get('is_active'):
         return jsonify({
             'success': False,
             'error': f"Cannot set '{target.get('name')}' as {role.upper()} LLM: Provider is currently inactive (is_active = 0). Please enable it first."
@@ -448,31 +446,43 @@ def set_provider_role_route(provider_id):
             other_prov = next((p for p in providers if p['model_name'] != target_model and p.get('is_active')), None)
             new_fallback = current_default if (current_default != target_model) else (other_prov['model_name'] if other_prov else '')
             db.set_system_config('fallback_model', new_fallback)
+        message = f"'{target.get('name')}' is now assigned as PRIMARY LLM"
     elif role == 'fallback':
-        db.set_system_config('fallback_model', target_model)
-        # If target was previously the default model, swap so roles stay clean and distinct
-        if current_default == target_model:
-            other_prov = next((p for p in providers if p['model_name'] != target_model and p.get('is_active')), None)
-            new_default = current_fallback if (current_fallback != target_model) else (other_prov['model_name'] if other_prov else '')
-            db.set_system_config('default_model', new_default)
+        if current_fallback == target_model:
+            # Clicking fallback on currently assigned fallback provider toggles/unassigns it
+            db.set_system_config('fallback_model', '')
+            message = f"Removed Fallback role from '{target.get('name')}'"
+        else:
+            db.set_system_config('fallback_model', target_model)
+            # If target was previously the default model, swap so roles stay clean and distinct
+            if current_default == target_model:
+                other_prov = next((p for p in providers if p['model_name'] != target_model and p.get('is_active')), None)
+                new_default = current_fallback if (current_fallback != target_model) else (other_prov['model_name'] if other_prov else '')
+                db.set_system_config('default_model', new_default)
+            message = f"'{target.get('name')}' is now assigned as FALLBACK LLM"
+    elif role in ('remove_fallback', 'unset_fallback', 'clear_fallback', 'none'):
+        db.set_system_config('fallback_model', '')
+        message = f"Fallback LLM role unassigned"
     else:
         return jsonify({'success': False, 'error': f"Unknown role: {role}"}), 400
 
     user = getattr(request, 'current_user', {})
     if user.get('id'):
-        db.log_audit(user['id'], 'ADMIN_SET_LLM_ROLE', f"Set {target.get('name')} as {role.upper()} model ({target_model})")
+        db.log_audit(user['id'], 'ADMIN_SET_LLM_ROLE', f"Set role {role} for {target.get('name')} ({target_model})")
 
     default_model = db.get_system_config('default_model') or ''
     fallback_model = db.get_system_config('fallback_model') or ''
 
-    for p in providers:
-        p['is_default'] = bool(default_model and p.get('model_name') == default_model)
-        p['is_fallback'] = bool(fallback_model and p.get('model_name') == fallback_model)
+    updated_providers = db.get_all_llm_providers()
+    for p in updated_providers:
+        p_act = bool(p.get('is_active'))
+        p['is_default'] = bool(p_act and default_model and p.get('model_name') == default_model)
+        p['is_fallback'] = bool(p_act and fallback_model and p.get('model_name') == fallback_model)
 
     return jsonify({
         'success': True,
-        'message': f"'{target.get('name')}' is now assigned as {role.upper()} LLM",
-        'providers': providers,
+        'message': message,
+        'providers': updated_providers,
         'default_model': default_model,
         'fallback_model': fallback_model
     })
