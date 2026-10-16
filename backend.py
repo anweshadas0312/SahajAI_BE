@@ -595,20 +595,32 @@ class Backend_Api:
             if guardrails.is_standard_mode(jailbreak):
                 # Phase 1: Explicit Chart Intent Guardrails for Standard Mode
                 chart_intent = guardrails.evaluate_chart_intent(user_prompt_text)
+                derived_chart = None
                 if chart_intent['decision'] == guardrails.ChartIntentDecision.GENERATE:
-                    chart_directive = guardrails.get_chart_directive(chart_intent['chart_type'])
+                    if active_file_ids:
+                        for fid in active_file_ids:
+                            sp = None
+                            if conv_files:
+                                cf = next((f for f in conv_files if str(f.get('id', '')) == str(fid)), None)
+                                if cf and cf.get('storage_path'):
+                                    sp = guardrails.get_local_storage_path(cf.get('storage_path', ''))
+                            if not sp and 'file_context_eval' in locals() and file_context_eval.get('matched_files'):
+                                mf = next((f for f in file_context_eval['matched_files'] if str(f.get('id', '')) == str(fid)), None)
+                                if mf and mf.get('storage_path'):
+                                    sp = guardrails.get_local_storage_path(mf.get('storage_path', ''))
+                            if not sp:
+                                try:
+                                    f_rec = db.get_file_by_id(fid)
+                                    if f_rec and f_rec.get('storage_path'):
+                                        sp = guardrails.get_local_storage_path(f_rec.get('storage_path', ''))
+                                except Exception:
+                                    pass
+                            if sp:
+                                derived_chart = guardrails.derive_tabular_chart_data(sp, user_prompt_text, chart_intent['chart_type'])
+                                if derived_chart:
+                                    break
+                    chart_directive = guardrails.get_chart_directive(chart_intent['chart_type'], derived_metrics=derived_chart)
                     final_prompt_content = final_prompt_content + chart_directive
-                else:
-                    # Consecutive-turn independence & false-positive prevention:
-                    # Explicitly instruct the model NOT to generate any chart block for this non-chart request,
-                    # preventing history bleeding from earlier conversation turns.
-                    no_chart_instruction = (
-                        "\n\n[NO CHART REQUESTED]:\n"
-                        "The user did NOT request a chart in this message. Do NOT generate or include any ```chart code block in your response, "
-                        "even if previous messages in this conversation contain charts. Respond strictly with clear text, explanations, or standard markdown formatting. "
-                        "Never mention, quote, or discuss the '[NO CHART REQUESTED]' directive or any chart instructions in your answer."
-                    )
-                    final_prompt_content = final_prompt_content + no_chart_instruction
 
                 conversation.append({'role': 'user', 'content': final_prompt_content})
 
@@ -778,26 +790,44 @@ class Backend_Api:
                                             chart_buffer.append(content)
                                             buf_str = "".join(chart_buffer)
 
-                                            first_non_ws = buf_str.lstrip()
-                                            if len(first_non_ws) >= 8 and not first_non_ws.startswith('```'):
-                                                # Model did not start with ```chart, flush buffer
-                                                chart_validated = True
-                                                for c in chart_buffer:
-                                                    assistant_accumulated.append(c)
-                                                    yield f"data: {json.dumps({'type': 'content', 'delta': c})}\n\n"
-                                                chart_buffer = []
-                                            elif '```' in buf_str[3:]:
-                                                # Chart code block is complete, validate it
-                                                chart_validated = True
-                                                expected_c_type = chart_intent.get('chart_type') if 'chart_intent' in locals() else None
-                                                is_v, clean_text, payload_res, v_err = guardrails.validate_and_sanitize_chart_response(
-                                                    buf_str,
-                                                    expected_chart_type=expected_c_type,
-                                                    file_context=file_context_msg
-                                                )
-                                                assistant_accumulated.append(clean_text)
-                                                yield f"data: {json.dumps({'type': 'content', 'delta': clean_text})}\n\n"
-                                                chart_buffer = []
+                                            open_idx = buf_str.find('```')
+                                            if open_idx != -1:
+                                                if open_idx > 0:
+                                                    # Flush introductory prose before the chart block immediately
+                                                    intro_chunk = buf_str[:open_idx]
+                                                    assistant_accumulated.append(intro_chunk)
+                                                    yield f"data: {json.dumps({'type': 'content', 'delta': intro_chunk})}\n\n"
+                                                    buf_str = buf_str[open_idx:]
+                                                    chart_buffer = [buf_str]
+
+                                                close_idx = buf_str.find('```', 3)
+                                                if close_idx != -1:
+                                                    # Chart code block is complete, validate and sanitize it
+                                                    chart_validated = True
+                                                    chart_block_text = buf_str[:close_idx + 3]
+                                                    trailing_text = buf_str[close_idx + 3:]
+
+                                                    expected_c_type = chart_intent.get('chart_type') if 'chart_intent' in locals() else None
+                                                    is_v, clean_text, payload_res, v_err = guardrails.validate_and_sanitize_chart_response(
+                                                        chart_block_text,
+                                                        expected_chart_type=expected_c_type,
+                                                        file_context=file_context_msg,
+                                                        derived_chart=derived_chart if 'derived_chart' in locals() else None
+                                                    )
+                                                    assistant_accumulated.append(clean_text)
+                                                    yield f"data: {json.dumps({'type': 'content', 'delta': clean_text})}\n\n"
+                                                    if trailing_text:
+                                                        assistant_accumulated.append(trailing_text)
+                                                        yield f"data: {json.dumps({'type': 'content', 'delta': trailing_text})}\n\n"
+                                                    chart_buffer = []
+                                            else:
+                                                # No ``` backticks found yet
+                                                if len(buf_str) > 300:
+                                                    # Safely stream leading prose without losing any forming backticks
+                                                    flush_part = buf_str[:-20]
+                                                    assistant_accumulated.append(flush_part)
+                                                    yield f"data: {json.dumps({'type': 'content', 'delta': flush_part})}\n\n"
+                                                    chart_buffer = [buf_str[-20:]]
                                         elif eval_gate_active:
                                             filtered_content = re.sub(r'\[NO CHART REQUESTED\]:?', '', content)
                                             if filtered_content:
@@ -819,7 +849,8 @@ class Backend_Api:
                                 is_v, clean_text, payload_res, v_err = guardrails.validate_and_sanitize_chart_response(
                                     buf_str,
                                     expected_chart_type=expected_c_type,
-                                    file_context=file_context_msg
+                                    file_context=file_context_msg,
+                                    derived_chart=derived_chart if 'derived_chart' in locals() else None
                                 )
                                 assistant_accumulated.append(clean_text)
                                 yield f"data: {json.dumps({'type': 'content', 'delta': clean_text})}\n\n"
@@ -978,15 +1009,19 @@ class Backend_Api:
             if assistant_accumulated and conversation_id:
                 try:
                     full_reply = "".join(assistant_accumulated)
-                    # Sanitize any accidental prompt leakages such as [NO CHART REQUESTED]
-                    full_reply = re.sub(r'\[NO CHART REQUESTED\]:?', '', full_reply).strip()
-                    if guardrails.is_standard_mode(jailbreak) and is_chart:
-                        expected_c_type = chart_intent.get('chart_type') if 'chart_intent' in locals() else None
-                        _, full_reply, _, _ = guardrails.validate_and_sanitize_chart_response(
-                            full_reply,
-                            expected_chart_type=expected_c_type,
-                            file_context=file_context_msg
-                        )
+                    if guardrails.is_standard_mode(jailbreak):
+                        if is_chart:
+                            expected_c_type = chart_intent.get('chart_type') if 'chart_intent' in locals() else None
+                            _, full_reply, _, _ = guardrails.validate_and_sanitize_chart_response(
+                                full_reply,
+                                expected_chart_type=expected_c_type,
+                                file_context=file_context_msg,
+                                derived_chart=derived_chart if 'derived_chart' in locals() else None
+                            )
+                        else:
+                            # Standard non-chart turn: ensure no stray delimiter leaks or unsolicited chart blocks
+                            full_reply = re.sub(r'```(?:chart|pie|bar|line)\b', '```text', full_reply, flags=re.IGNORECASE)
+                            full_reply = re.sub(r'\s*\[(?:END OF CHART REQUEST|NO CHART REQUESTED)\]:?', '', full_reply, flags=re.IGNORECASE).strip()
                     db.add_message(conversation_id, 'assistant', full_reply, workspace_id=workspace_id)
                 except Exception as dbe:
                     print(f"[DB] Note: {dbe}")
@@ -1113,14 +1148,6 @@ def build_messages(jailbreak):
         if chart_intent['decision'] == guardrails.ChartIntentDecision.GENERATE:
             chart_directive = guardrails.get_chart_directive(chart_intent['chart_type'])
             final_prompt_content = final_prompt_content + chart_directive
-        else:
-            no_chart_instruction = (
-                "\n\n[NO CHART REQUESTED]:\n"
-                "The user did NOT request a chart in this message. Do NOT generate or include any ```chart code block in your response, "
-                "even if previous messages in this conversation contain charts. Respond strictly with clear text, explanations, or standard markdown formatting. "
-                "Never mention, quote, or discuss the '[NO CHART REQUESTED]' directive or any chart instructions in your answer."
-            )
-            final_prompt_content = final_prompt_content + no_chart_instruction
 
         conversation.append({'role': 'user', 'content': final_prompt_content})
 

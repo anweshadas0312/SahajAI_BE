@@ -151,7 +151,7 @@ class TestConsecutiveTurnIndependence(unittest.TestCase):
 
     def test_build_messages_turn_independence(self):
         """
-        Verifies build_messages attaches [NO CHART REQUESTED] when current turn is non-chart,
+        Verifies build_messages does NOT inject chart directives or delimiters when current turn is non-chart,
         even if history contains a chart response from the assistant.
         """
         history_with_chart = [
@@ -174,7 +174,9 @@ class TestConsecutiveTurnIndependence(unittest.TestCase):
             messages = backend.build_messages(jailbreak="default")
             last_msg = messages[-1]
             self.assertEqual(last_msg["role"], "user")
-            self.assertIn("[NO CHART REQUESTED]", last_msg["content"])
+            self.assertEqual(last_msg["content"], "What does this data mean for Q3 planning?")
+            self.assertNotIn("[NO CHART REQUESTED]", last_msg["content"])
+            self.assertNotIn("[END OF CHART REQUEST]", last_msg["content"])
             self.assertNotIn("[MANDATORY INSTRUCTION FOR", last_msg["content"])
 
 
@@ -241,6 +243,173 @@ class TestChartPipelineIntegration(unittest.TestCase):
             # Should NOT contain Standard Mode system prompt
             has_sahaj_ident = any("You are SahajAI" in m.get("content", "") for m in messages)
             self.assertFalse(has_sahaj_ident, "Standard Mode identity leaked into DAN mode")
+
+
+class TestChartLeakPreventionRegression(unittest.TestCase):
+    """
+    Regression test suite ensuring chart directives, markers, and explanations
+    never leak into normal conversations or non-chart turns in Standard Mode.
+    """
+
+    def test_ordinary_conversation_without_attachment(self):
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "content": {
+                    "conversation": [],
+                    "internet_access": False,
+                    "parts": [{"content": "How do hackers steal passwords?"}]
+                }
+            },
+            "conversation_id": "test_conv_passwords"
+        }
+        with patch("backend.request", req_mock):
+            messages = backend.build_messages(jailbreak="default")
+            last_msg = messages[-1]
+            self.assertEqual(last_msg["role"], "user")
+            self.assertEqual(last_msg["content"], "How do hackers steal passwords?")
+            self.assertNotIn("[NO CHART REQUESTED]", last_msg["content"])
+            self.assertNotIn("[END OF CHART REQUEST]", last_msg["content"])
+            self.assertNotIn("Chart Requested:", last_msg["content"])
+            self.assertNotIn("[MANDATORY INSTRUCTION FOR", last_msg["content"])
+
+    def test_uploaded_file_summary_without_chart_request(self):
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "file_ids": ["f123"],
+                "content": {
+                    "conversation": [],
+                    "internet_access": False,
+                    "parts": [{"content": "Please summarize and analyze the attached document."}]
+                }
+            },
+            "conversation_id": "test_conv_summary"
+        }
+        with patch("backend.request", req_mock), \
+             patch("backend.rag_engine.retrieve_file_context", return_value=[{"text": "Sample data", "file_name": "data.csv"}]), \
+             patch("backend.rag_engine.format_context_block", return_value="--- Context Block ---"):
+            messages = backend.build_messages(jailbreak="default")
+            last_msg = messages[-1]
+            self.assertEqual(last_msg["role"], "user")
+            self.assertNotIn("[NO CHART REQUESTED]", last_msg["content"])
+            self.assertNotIn("[END OF CHART REQUEST]", last_msg["content"])
+            self.assertNotIn("Chart Requested:", last_msg["content"])
+            self.assertNotIn("[MANDATORY INSTRUCTION FOR", last_msg["content"])
+
+    def test_markdown_table_request_without_chart_request(self):
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "content": {
+                    "conversation": [],
+                    "internet_access": False,
+                    "parts": [{"content": "Create a markdown table comparing product prices and quantities."}]
+                }
+            },
+            "conversation_id": "test_conv_table"
+        }
+        with patch("backend.request", req_mock):
+            messages = backend.build_messages(jailbreak="default")
+            last_msg = messages[-1]
+            self.assertEqual(last_msg["role"], "user")
+            self.assertNotIn("[NO CHART REQUESTED]", last_msg["content"])
+            self.assertNotIn("[END OF CHART REQUEST]", last_msg["content"])
+            self.assertNotIn("[MANDATORY INSTRUCTION FOR", last_msg["content"])
+            intent = guardrails.evaluate_chart_intent("Create a markdown table comparing product prices and quantities.")
+            self.assertEqual(intent["decision"], guardrails.ChartIntentDecision.NONE)
+
+    def test_follow_up_question_after_chart(self):
+        history = [
+            {"role": "user", "content": "Create a line chart of daily orders."},
+            {"role": "assistant", "content": '```chart\n{"type": "line", "title": "Orders", "data": [{"name": "01-Jan-17", "value": 7}]}\n```\nHere is the chart.'}
+        ]
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "content": {
+                    "conversation": history,
+                    "internet_access": False,
+                    "parts": [{"content": "What does this trend imply for next quarter?"}]
+                }
+            },
+            "conversation_id": "test_conv_followup"
+        }
+        with patch("backend.request", req_mock):
+            messages = backend.build_messages(jailbreak="default")
+            last_msg = messages[-1]
+            self.assertEqual(last_msg["role"], "user")
+            self.assertEqual(last_msg["content"], "What does this trend imply for next quarter?")
+            self.assertNotIn("[NO CHART REQUESTED]", last_msg["content"])
+            self.assertNotIn("[END OF CHART REQUEST]", last_msg["content"])
+            self.assertNotIn("[MANDATORY INSTRUCTION FOR", last_msg["content"])
+
+    def test_document_containing_end_of_chart_request_marker(self):
+        doc_with_marker = "Document Header\nSome text [END OF CHART REQUEST] with chart code block inside\nEnd of Document"
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "file_ids": ["f_marker"],
+                "content": {
+                    "conversation": [],
+                    "internet_access": False,
+                    "parts": [{"content": "Explain the key findings of this report."}]
+                }
+            },
+            "conversation_id": "test_conv_marker_doc"
+        }
+        with patch("backend.request", req_mock), \
+             patch("backend.rag_engine.retrieve_file_context", return_value=[{"text": doc_with_marker, "file_name": "report.txt"}]), \
+             patch("backend.rag_engine.format_context_block", return_value=f"--- Context ---\n{doc_with_marker}"):
+            messages = backend.build_messages(jailbreak="default")
+            intent = guardrails.evaluate_chart_intent("Explain the key findings of this report.")
+            self.assertEqual(intent["decision"], guardrails.ChartIntentDecision.NONE)
+            # The system prompt must NOT have mandatory chart instructions
+            sys_msg = messages[0]["content"]
+            self.assertNotIn("[MANDATORY INSTRUCTION FOR", sys_msg)
+
+    def test_explicit_line_chart_order_csv_still_works(self):
+        prompt = "Using the earlier order.csv file, create a line chart of total quantity ordered by order date. Use only the order data and aggregate quantities by date."
+        intent = guardrails.evaluate_chart_intent(prompt)
+        self.assertEqual(intent["decision"], guardrails.ChartIntentDecision.GENERATE)
+        self.assertEqual(intent["chart_type"], "line")
+
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "content": {
+                    "conversation": [],
+                    "internet_access": False,
+                    "parts": [{"content": prompt}]
+                }
+            },
+            "conversation_id": "test_conv_line_chart"
+        }
+        with patch("backend.request", req_mock):
+            messages = backend.build_messages(jailbreak="default")
+            last_msg = messages[-1]
+            self.assertIn("[MANDATORY INSTRUCTION FOR LINE CHART]:", last_msg["content"])
+            sys_msg = messages[0]["content"]
+            self.assertIn("Line Chart", sys_msg)
+
+    def test_evilbot_preservation(self):
+        req_mock = MagicMock()
+        req_mock.json = {
+            "meta": {
+                "content": {
+                    "conversation": [],
+                    "internet_access": False,
+                    "parts": [{"content": "Create a visual plot"}]
+                }
+            },
+            "conversation_id": "conv_evil_test"
+        }
+        with patch("backend.request", req_mock):
+            messages = backend.build_messages(jailbreak="gpt-evil")
+            has_evil = any("EvilBOT" in m.get("content", "") for m in messages)
+            self.assertTrue(has_evil, "EvilBOT instructions missing")
+            has_sahaj_ident = any("You are SahajAI" in m.get("content", "") for m in messages)
+            self.assertFalse(has_sahaj_ident, "Standard Mode identity leaked into EvilBOT mode")
 
 
 if __name__ == '__main__':

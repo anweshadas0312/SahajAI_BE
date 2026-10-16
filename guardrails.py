@@ -6,6 +6,7 @@ Covers:
 - Phase 2: Core Content Guardrails (Self-Harm, Violence, Adult, Sensitive Info, Hate/Harassment, Politics, Medical/Legal/Financial)
 """
 
+import os
 import re
 import json
 import math
@@ -593,7 +594,137 @@ def evaluate_chart_intent(prompt: str) -> Dict[str, Any]:
     }
 
 
-def get_chart_directive(chart_type: str) -> str:
+def get_local_storage_path(storage_path: str) -> Optional[str]:
+    """Resolves local absolute storage path for an active uploaded file."""
+    if not storage_path:
+        return None
+    if os.path.exists(storage_path):
+        return storage_path
+    base_name = os.path.basename(storage_path)
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    local_path = os.path.join(cur_dir, 'uploads', base_name)
+    if os.path.exists(local_path):
+        return local_path
+    return None
+
+
+def derive_tabular_chart_data(file_path: str, user_prompt: str, chart_type: str = "line") -> Optional[dict]:
+    """
+    Derives verified aggregated chart metrics directly from an active CSV/tabular file
+    based on the user prompt requirements, without hardcoded fallback values.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return None
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in ('.csv', '.tsv', '.txt'):
+        return None
+
+    import csv
+    from collections import defaultdict
+    import dateutil.parser
+
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return None
+            rows = [row for row in reader if row]
+    except Exception:
+        return None
+
+    header_clean = [h.strip() for h in header]
+    date_col_idx = None
+    qty_col_idx = None
+
+    # Look for date column
+    date_candidates = []
+    for idx, col in enumerate(header_clean):
+        col_lower = col.lower()
+        if 'order' in col_lower and 'date' in col_lower:
+            date_candidates.insert(0, idx)
+        elif 'date' in col_lower or 'time' in col_lower or 'day' in col_lower:
+            date_candidates.append(idx)
+
+    for c_idx in date_candidates:
+        valid_date_count = 0
+        for row in rows[:20]:
+            if c_idx < len(row):
+                val = row[c_idx].strip()
+                try:
+                    dateutil.parser.parse(val, fuzzy=False)
+                    valid_date_count += 1
+                except Exception:
+                    pass
+        if valid_date_count >= 5:
+            date_col_idx = c_idx
+            break
+
+    # Look for value/quantity column
+    val_candidates = []
+    for idx, col in enumerate(header_clean):
+        col_lower = col.lower()
+        if 'quantity' in col_lower or 'qty' in col_lower:
+            val_candidates.insert(0, idx)
+        elif 'amount' in col_lower or 'total' in col_lower or 'price' in col_lower or 'count' in col_lower or 'value' in col_lower:
+            val_candidates.append(idx)
+
+    for c_idx in val_candidates:
+        valid_num_count = 0
+        for row in rows[:20]:
+            if c_idx < len(row):
+                val = row[c_idx].strip()
+                try:
+                    float(val)
+                    valid_num_count += 1
+                except Exception:
+                    pass
+        if valid_num_count >= 5:
+            qty_col_idx = c_idx
+            break
+
+    if date_col_idx is None or qty_col_idx is None:
+        return None
+
+    daily_totals = defaultdict(float)
+    date_map = {}
+    for row in rows:
+        if date_col_idx < len(row) and qty_col_idx < len(row):
+            d_str = row[date_col_idx].strip()
+            v_str = row[qty_col_idx].strip()
+            try:
+                dt = dateutil.parser.parse(d_str, fuzzy=False)
+                v = float(v_str)
+                daily_totals[dt] += v
+                if dt not in date_map:
+                    date_map[dt] = d_str
+            except Exception:
+                continue
+
+    if not daily_totals:
+        return None
+
+    sorted_dates = sorted(daily_totals.keys())
+    data = []
+    for dt in sorted_dates:
+        orig_lbl = date_map[dt]
+        val = daily_totals[dt]
+        val_clean = int(val) if val.is_integer() else round(val, 2)
+        data.append({
+            "name": orig_lbl,
+            "value": val_clean
+        })
+
+    title = "Total Quantity Ordered by Order Date"
+    return {
+        "type": "line",
+        "title": title,
+        "data": data
+    }
+
+
+def get_chart_directive(chart_type: str, derived_metrics: Optional[dict] = None) -> str:
     """
     Returns strict type-specific system and user prompt directives
     to ensure the model formats real extracted data according to the exact chart type requested.
@@ -647,6 +778,16 @@ def get_chart_directive(chart_type: str) -> str:
             "START WITH ```chart DIRECTLY."
         )
     elif chart_type == ChartType.LINE:
+        derived_section = ""
+        if derived_metrics and derived_metrics.get('data'):
+            m_items = derived_metrics['data']
+            m_lines = "\n".join(f'    {{"name": "{it["name"]}", "value": {it["value"]}}}' for it in m_items)
+            derived_section = (
+                f"\n   - VERIFIED DISCRETE DAILY METRICS DERIVED FROM ACTIVE DOCUMENT:\n"
+                f"     The active document contains the following verified discrete daily totals:\n"
+                f"{m_lines}\n"
+                f"     You MUST construct the line chart JSON using PRECISELY these discrete data points.\n"
+            )
         return (
             "\n\n[MANDATORY INSTRUCTION FOR LINE CHART]:\n"
             "The user explicitly requested a Line Chart visualization.\n"
@@ -655,8 +796,12 @@ def get_chart_directive(chart_type: str) -> str:
             "   - DO NOT hallucinate, invent placeholder data, or reuse topics/entities from earlier messages or other files.\n"
             "   - INSUFFICIENT DATA POLICY: If the active document does not contain sufficient real numerical metrics to create this chart, DO NOT invent dummy numbers and DO NOT borrow data from other files. Instead, explain clearly that the document lacks the necessary data to construct the chart.\n"
             "   - Line charts represent continuous data or trends over sequential time periods / ordered points.\n"
-            "2. START WITH ```chart: You MUST start your response immediately with the ```chart JSON code block as the very first characters of your output.\n"
-            "3. JSON Format:\n"
+            "   - AGGREGATION (NON-CUMULATIVE): When aggregating or grouping by date/time (e.g. total quantity ordered by order date), compute the discrete aggregated sum for each specific date. DO NOT calculate a cumulative running sum unless the user explicitly requested a cumulative sum.\n"
+            "   - CHRONOLOGICAL ORDER: Order the time points and dates chronologically from earliest to latest on the X-axis.\n"
+            f"{derived_section}"
+            "2. START WITH ```chart: You MUST start your response immediately with the ```chart JSON code block as the very first characters of your output. Do NOT write ```chart: or append any colons/text to the code block tag.\n"
+            "3. STRICT JSON Format:\n"
+            "   - All category/time names MUST be valid JSON strings (e.g. \"01-Jan-17\" or \"2017-01-01\"). NEVER use JavaScript expressions like new Date(), functions, or unquoted identifiers.\n"
             "```chart\n"
             "{\n"
             '  "type": "line",\n'
@@ -938,6 +1083,24 @@ def validate_line_chart_ordering(data: list) -> Tuple[bool, Optional[str]]:
             return False, f"Line chart quarters on the X-axis are not in chronological order: {labels}"
         return True, None
 
+    # 5. General Calendar Dates (e.g., '01-Jan-17', '02-Jan-2017', '2017/01/01', '01-01-2017')
+    try:
+        import dateutil.parser
+        parsed_dates = []
+        is_all_dates = True
+        for lbl in labels:
+            if re.match(r'^\d+$', lbl):
+                is_all_dates = False
+                break
+            dt = dateutil.parser.parse(lbl, fuzzy=False)
+            parsed_dates.append(dt)
+        if is_all_dates and len(parsed_dates) == len(labels):
+            if parsed_dates != sorted(parsed_dates):
+                return False, f"Line chart dates on the X-axis are not in chronological order: {labels}"
+            return True, None
+    except Exception:
+        pass
+
     return True, None
 
 
@@ -1045,7 +1208,8 @@ def validate_chart_payload(
 def validate_and_sanitize_chart_response(
     response_text: str,
     expected_chart_type: Optional[str] = None,
-    file_context: Optional[str] = None
+    file_context: Optional[str] = None,
+    derived_chart: Optional[dict] = None
 ) -> Tuple[bool, str, Optional[dict], Optional[str]]:
     """
     Parses any ```chart block in response_text, performs strict schema & data validation,
@@ -1058,26 +1222,87 @@ def validate_and_sanitize_chart_response(
     if not response_text:
         return True, "", None, None
 
-    # Match code block labeled ```chart, ```pie, ```bar, ```line, or ```json
-    chart_match = re.search(r'```(?:chart|pie|bar|line)?\s*(\{[\s\S]*?\})\s*```', response_text)
+    # Match code block with chart-related tag (chart, pie, bar, line), allowing optional colons/spaces
+    # e.g., ```chart, ``` chart:, ```line, ```pie, or untagged ``` containing JSON
+    chart_pattern = re.compile(
+        r'```[ \t]*(chart|pie|bar|line)?(?:[: \t][^\n]*)?\n([\s\S]*?)(?:```|$)',
+        re.IGNORECASE
+    )
+    chart_match = chart_pattern.search(response_text)
     if not chart_match:
-        # Check if model emitted ```chart with unclosed backticks
-        unclosed_match = re.search(r'```(?:chart|pie|bar|line)?\s*(\{[\s\S]*)$', response_text)
-        if unclosed_match:
-            chart_match = unclosed_match
-        else:
+        # Check unclosed code block at end of stream
+        unclosed_pattern = re.compile(
+            r'```[ \t]*(chart|pie|bar|line)?(?:[: \t][^\n]*)?\n?([\s\S]*)$',
+            re.IGNORECASE
+        )
+        chart_match = unclosed_pattern.search(response_text)
+        if not chart_match:
+            if expected_chart_type and derived_chart and isinstance(derived_chart, dict):
+                is_dv, _ = validate_chart_payload(derived_chart, expected_type=expected_chart_type, file_context=file_context)
+                if is_dv:
+                    clean_block = f"```chart\n{json.dumps(derived_chart, indent=2)}\n```"
+                    sanitized = clean_block + ("\n\n" + response_text.strip() if response_text.strip() else "")
+                    return True, sanitized.strip(), derived_chart, None
             return True, response_text, None, None
 
-    raw_json_str = chart_match.group(1).strip()
+    tag = (chart_match.group(1) or "").lower()
+    content = chart_match.group(2) or ""
+
+    # If untagged codeblock and not an explicit chart request and no JSON object inside, leave untouched
+    if not tag and not expected_chart_type and "{" not in content:
+        return True, response_text, None, None
+
+    type_label = (expected_chart_type or tag or "Chart").capitalize()
+    start_brace = content.find('{')
+    end_brace = content.rfind('}')
+
+    if start_brace == -1 or end_brace == -1 or end_brace < start_brace:
+        if derived_chart and isinstance(derived_chart, dict):
+            is_dv, _ = validate_chart_payload(derived_chart, expected_type=expected_chart_type, file_context=file_context)
+            if is_dv:
+                clean_block = f"```chart\n{json.dumps(derived_chart, indent=2)}\n```"
+                sanitized = response_text[:chart_match.start()] + clean_block + "\n\n" + content.strip() + response_text[chart_match.end():]
+                return True, sanitized.strip(), derived_chart, None
+
+        replacement = (
+            f"⚠️ **Chart Generation Limitation:** I was unable to display a visual {type_label} Chart from the active document.\n"
+            f"- **Reason:** Missing or malformed chart specification payload.\n\n"
+            f"Here is the textual breakdown of the data instead:\n\n"
+        )
+        sanitized = response_text[:chart_match.start()] + replacement + content.strip() + "\n\n" + response_text[chart_match.end():]
+        return False, sanitized.strip(), None, "Missing JSON in chart block"
+
+    raw_json_str = content[start_brace:end_brace + 1]
+
+    # Pre-clean JS expressions like new Date(...) and trailing commas
+    cleaned_json = raw_json_str
+    def _replace_new_date(match):
+        try:
+            y = int(match.group(1))
+            m = int(match.group(2)) + 1
+            d = int(match.group(3))
+            return f'"{y:04d}-{m:02d}-{d:02d}"'
+        except Exception:
+            return '""'
+    cleaned_json = re.sub(r'new\s+Date\(\s*(\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)', _replace_new_date, cleaned_json)
+    cleaned_json = re.sub(r'new\s+Date\(\s*["\']([^"\']+)["\']\s*\)', r'"\1"', cleaned_json)
+    cleaned_json = re.sub(r',\s*([}\]])', r'\1', cleaned_json)
 
     # Attempt JSON parse
     try:
-        payload = json.loads(raw_json_str)
+        payload = json.loads(cleaned_json)
     except Exception as je:
+        if derived_chart and isinstance(derived_chart, dict):
+            is_dv, _ = validate_chart_payload(derived_chart, expected_type=expected_chart_type, file_context=file_context)
+            if is_dv:
+                clean_block = f"```chart\n{json.dumps(derived_chart, indent=2)}\n```"
+                sanitized = response_text[:chart_match.start()] + clean_block + response_text[chart_match.end():]
+                return True, sanitized, derived_chart, None
+
         err_msg = f"Malformed JSON in chart block: {str(je)}"
         replacement = (
-            f"⚠️ **Chart Generation Limitation:** I was unable to display a visual chart because the extracted "
-            f"chart data contained malformed JSON formatting. Here is the data breakdown from the document instead:\n\n"
+            f"⚠️ **Chart Generation Limitation:** I was unable to display a visual {type_label} Chart because the extracted "
+            f"chart data contained malformed JSON formatting ({str(je)}). Here is the data breakdown from the document instead:\n\n"
         )
         sanitized = response_text[:chart_match.start()] + replacement + response_text[chart_match.end():]
         return False, sanitized.strip(), None, err_msg
@@ -1085,6 +1310,13 @@ def validate_and_sanitize_chart_response(
     # Validate schema and data
     is_valid, val_err = validate_chart_payload(payload, expected_type=expected_chart_type, file_context=file_context)
     if not is_valid:
+        if derived_chart and isinstance(derived_chart, dict):
+            is_dv, _ = validate_chart_payload(derived_chart, expected_type=expected_chart_type, file_context=file_context)
+            if is_dv:
+                clean_block = f"```chart\n{json.dumps(derived_chart, indent=2)}\n```"
+                sanitized = response_text[:chart_match.start()] + clean_block + response_text[chart_match.end():]
+                return True, sanitized, derived_chart, None
+
         type_label = (expected_chart_type or payload.get('type') or 'Chart').capitalize()
         replacement = (
             f"⚠️ **Chart Generation Limitation:** I was unable to generate a visual {type_label} Chart from the active document.\n"
@@ -1094,5 +1326,8 @@ def validate_and_sanitize_chart_response(
         sanitized = response_text[:chart_match.start()] + replacement + response_text[chart_match.end():]
         return False, sanitized.strip(), None, val_err
 
-    return True, response_text, payload, None
+    # Re-serialize clean standard JSON block so output is clean, standard and resilient
+    clean_block = f"```chart\n{json.dumps(payload, indent=2)}\n```"
+    sanitized = response_text[:chart_match.start()] + clean_block + response_text[chart_match.end():]
+    return True, sanitized, payload, None
 
