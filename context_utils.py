@@ -254,3 +254,256 @@ def prepare_messages(messages: list, provider: dict, question: str, reserve_outp
             last['content'] = condense_context(head, question, provider, allow) + sep + tail
 
     return fit_messages_to_window(msgs, provider, reserve_output)
+
+
+def clean_search_query(raw_query: str) -> str:
+    """
+    Cleans conversational boilerplate, instructions, and dates from a raw user prompt
+    to construct a crisp, high-precision search engine query.
+    """
+    if not raw_query:
+        return ""
+    q = re.sub(r'^Current date:\s*\d{4}-\d{2}-\d{2}\.\s*', '', raw_query, flags=re.IGNORECASE).strip()
+
+    prefixes = [
+        r'^(?:please\s+)?(?:can|could)\s+you\s+(?:please\s+)?(?:search\s+(?:the\s+web\s+)?(?:for\s+|and\s+)?)?',
+        r'^please\s+(?:search\s+(?:the\s+web\s+)?(?:for\s+|and\s+)?)?',
+        r'^search\s+(?:the\s+web\s+)?(?:for\s+|and\s+)?',
+        r'^(?:tell\s+me\s+(?:about\s+)?|find\s+(?:out\s+)?|give\s+me\s+|explain\s+)',
+        r'^(?:what|who|where|when|why|how)\s+(?:is|are|was|were)\s+(?:the\s+)?'
+    ]
+    cleaned = q
+    changed = True
+    while changed:
+        before = cleaned
+        for p in prefixes:
+            candidate = re.sub(p, '', cleaned, flags=re.IGNORECASE).strip()
+            if candidate and len(candidate) >= 3:
+                cleaned = candidate
+        changed = (cleaned != before)
+
+    # Remove trailing question marks or punctuation
+    cleaned = re.sub(r'[\?\.!]+$', '', cleaned).strip()
+    return cleaned if len(cleaned) >= 3 else q
+
+
+
+def determine_query_evidence_need(user_prompt: str, has_active_files: bool = False) -> tuple:
+    """
+    Dynamically determines if external web search retrieval is beneficial for the query.
+    Returns (needs_search: bool, strategy_reason: str).
+    Ensures search is not forced for self-contained math, pure code syntax, greetings, or file-only tasks.
+    """
+    if not user_prompt:
+        return False, "empty_query"
+
+    q = user_prompt.strip().lower()
+
+    # 1. Simple conversational greetings / thanks / identity
+    conversational_patterns = [
+        r'^(?:hi|hello|hey|greetings|good\s+(?:morning|afternoon|evening))\b',
+        r'^(?:thank\s+you|thanks|thx)\b',
+        r'^(?:who\s+are\s+you|what\s+is\s+your\s+name|what\s+can\s+you\s+do)\b'
+    ]
+    if any(re.match(p, q) for p in conversational_patterns):
+        return False, "conversational_greeting"
+
+    # 2. Pure mathematical calculations, arithmetic, or numerical formulas
+    math_patterns = [
+        r'^(?:what\s+is\s+)?(?:\d+\.?\d*\s*[\+\-\*\/\^\%]\s*\d+\.?\d*)',
+        r'^(?:what\s+is\s+|calculate\s+)?\d+(?:\.\d+)?\s*(?:percent|\%)\s*of\s*\d+',
+        r'^(?:calculate|compute|solve|simplify)\s+[\d\s\+\-\*\/\%\^\(\)\.\=a-zA-Z]+$',
+        r'^(?:what\s+is\s+)?the\s+square\s+root\s+of\s+\d+'
+    ]
+    if any(re.search(p, q) for p in math_patterns):
+        return False, "self_contained_math"
+
+    # 3. Pure programming language syntax / algorithm without external entity lookup
+    code_syntax_patterns = [
+        r'^(?:write|implement|create)\s+(?:a\s+)?(?:python|javascript|typescript|c\+\+|java|rust|go|c#)?\s*(?:function|script|code|algorithm|regex)\s+(?:to|for)\s+[a-zA-Z\s_]+$',
+        r'^(?:how\s+to\s+)?(?:reverse|sort|traverse|flatten|filter|map)\s+(?:a\s+)?(?:string|array|list|linked\s+list|tree|dict|dictionary)\s+in\s+[a-zA-Z\+\#]+'
+    ]
+    if any(re.search(p, q) for p in code_syntax_patterns):
+        return False, "self_contained_code"
+
+    # 4. Explicit file-only request when files are attached
+    if has_active_files:
+        file_only_indicators = [
+            'this file', 'the file', 'attached file', 'this document', 'the document',
+            'this pdf', 'the pdf', 'this csv', 'the sheet', 'summarize this', 'analyze this'
+        ]
+        if any(ind in q for ind in file_only_indicators) and 'search the web' not in q:
+            return False, "file_context_primary"
+
+    # 5. Default for real-world knowledge, external facts, current events, research
+    return True, "external_evidence_needed"
+
+
+def resolve_search_coreference(user_prompt: str, history: list) -> str:
+    """
+    Enhances a follow-up query with contextual nouns from previous conversation turns
+    when the user query uses pronouns ('it', 'he', 'she', 'they', 'this', 'that', 'its')
+    or elided phrases ('when was it built', 'second term', 'how many goals').
+    """
+    if not user_prompt or not history:
+        return user_prompt
+
+    q = user_prompt.strip()
+    q_low = q.lower()
+
+    coreference_markers = [
+        r'\b(?:it|its|he|his|him|she|her|they|their|them|this|that|these|those)\b',
+        r'^(?:when|where|who|why|how\s+many|how\s+much)\s+(?:was|did|is|are|were)\s+(?:it|he|she|they|this)\b',
+        r'^(?:and\s+)?(?:what\s+about|how\s+about)\s+'
+    ]
+
+    has_marker = any(re.search(m, q_low) for m in coreference_markers)
+    is_short_followup = len(q.split()) <= 4 and re.match(r'^(?:when|where|who|how|why|what|which)\b', q_low)
+
+    if not (has_marker or is_short_followup):
+        return user_prompt
+
+    # Extract the most recent user turn from history
+    last_user_turn = None
+    for msg in reversed(history):
+        if msg.get('role') == 'user' and msg.get('content'):
+            last_user_turn = msg['content'].strip()
+            break
+
+    if not last_user_turn:
+        return user_prompt
+
+    # Clean conversational lead-ins from the previous user turn to find the main subject
+    prev_cleaned = clean_search_query(last_user_turn)
+    words = prev_cleaned.split()
+    if not words:
+        return user_prompt
+
+    subject = " ".join(words[:4])
+    if subject.lower() in q_low:
+        return user_prompt
+
+    return f"{subject} {user_prompt}"
+
+
+def verify_number_consistency(answer_text: str, reference_text: str, user_query: str = "") -> tuple:
+    """
+    Checks whether specific numbers, percentages, or metrics cited in the answer
+    exist in the provided reference snippets or the user query itself.
+    Returns (found_ratio: float, unverified_nums: list).
+    """
+    if not answer_text or not reference_text:
+        return 1.0, []
+    
+    # Match numbers with 2+ digits or percentages (e.g., 2024, 6.5%, 1500)
+    raw_nums = re.findall(r'\b\d[\d,.]*(?:%|\b)', answer_text)
+    # Filter out trivial single digits (0-9) or standard markdown bullet indices
+    meaningful = [n.replace(',', '').strip() for n in raw_nums if re.search(r'\d{2,}|%', n)]
+    if not meaningful:
+        return 1.0, []
+
+    combined_ref = (reference_text + " " + (user_query or "")).replace(',', '')
+    unverified = [n for n in set(meaningful) if n not in combined_ref]
+    ratio = (len(meaningful) - len(unverified)) / len(meaningful)
+    return ratio, unverified
+
+
+def verify_temporal_consistency(query: str, answer_text: str, current_year: int) -> tuple:
+    """
+    Detects if the user asked a current/latest question but the answer asserts an outdated past year as current.
+    Returns (is_outdated: bool, issue_description: str).
+    """
+    if not query or not answer_text:
+        return False, ""
+    
+    q_low = query.lower()
+    time_keywords = ['today', 'current', 'currently', 'latest', 'now', 'recent', str(current_year)]
+    if any(k in q_low for k in time_keywords):
+        patterns = [
+            r'\bas of (?:[A-Za-z]+\s+)?(20\d{2})\b',
+            r'\bcurrently in (20\d{2})\b',
+            r'\bstatus in (20\d{2})\b',
+            r'\bthe current year is (20\d{2})\b'
+        ]
+        for pat in patterns:
+            for ym in re.finditer(pat, answer_text, re.IGNORECASE):
+                cited_year = int(ym.group(1))
+                if cited_year < current_year:
+                    return True, f"Answer cites outdated year {cited_year} as current context (current year: {current_year})"
+    return False, ""
+
+
+def is_time_sensitive_query(user_prompt: str) -> bool:
+    """
+    Returns True if the query explicitly asks for current, recent, live, or time-sensitive data.
+    """
+    if not user_prompt:
+        return False
+    q_low = user_prompt.lower()
+    time_keywords = [
+        'today', 'current', 'currently', 'latest', 'now', 'recent',
+        'live', 'stock', 'weather', 'score', 'news', 'price',
+        'this week', 'this month', 'this year'
+    ]
+    return any(re.search(rf'\b{re.escape(k)}\b', q_low) for k in time_keywords)
+
+
+def rank_and_filter_search_results(query: str, raw_results: list, max_results: int = 6) -> list:
+    """
+    Ranks and filters raw search engine results to discard low-quality, boilerplate,
+    or error snippets (e.g., 'Access Denied', 'Cloudflare', 'Just a moment...', empty text)
+    and sorts by query keyword relevance density.
+    """
+    if not raw_results:
+        return []
+
+    junk_patterns = [
+        r'access denied', r'attention required', r'cloudflare', r'verify you are human',
+        r'just a moment', r'enable javascript', r'sign in', r'robot or human',
+        r'403 forbidden', r'404 not found', r'browse thousands of titles',
+        r'read full articles, watch videos', r'cookies to continue'
+    ]
+
+    clean_q = clean_search_query(query).lower()
+    q_words = [w for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', clean_q) if w not in (
+        'what', 'when', 'where', 'which', 'who', 'how', 'the', 'and', 'for', 'about'
+    )]
+
+    scored = []
+    seen_urls = set()
+
+    for r in raw_results:
+        body = (r.get("body") or r.get("snippet") or "").strip()
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or r.get("href") or "").strip()
+
+        if not url or url in seen_urls:
+            continue
+        if len(body) < 25 and len(title) < 5:
+            continue
+
+        b_low = body.lower()
+        t_low = title.lower()
+        comb_low = f"{t_low} {b_low}"
+        if any(re.search(p, comb_low) for p in junk_patterns):
+            continue
+
+        score = 0.0
+        for w in q_words:
+            if w in t_low:
+                score += 2.0
+            if w in b_low:
+                score += 1.0
+
+        score += min(len(body) / 200.0, 1.0)
+        if "wikipedia.org" in url:
+            score += 2.5
+
+        seen_urls.add(url)
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:max_results]]
+
+
+

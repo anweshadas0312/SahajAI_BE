@@ -15,8 +15,11 @@ import guardrails
 import rag_engine
 import settings
 from context_utils import (count_tokens, count_messages_tokens, get_budget, pack_chunks, map_chunks,
-                           prepare_messages, context_overflows, generate_text,
-                           strip_reasoning, SEARCH_MARK, SEARCH_ID, USER_SEP)
+                           prepare_messages, context_overflows, generate_text, fit_to_budget,
+                           strip_reasoning, SEARCH_MARK, SEARCH_ID, USER_SEP,
+                           clean_search_query, verify_number_consistency, verify_temporal_consistency,
+                           determine_query_evidence_need, resolve_search_coreference,
+                           rank_and_filter_search_results, is_time_sensitive_query)
 
 
 
@@ -171,13 +174,81 @@ def _snippets_only(context_text: str, limit: int = 10**7) -> str:
     return (context_text or '').split(SEARCH_MARK)[0][:limit].strip()
 
 
+def _parse_judge_json(raw: str) -> dict:
+    """Safely extracts and parses JSON evaluation response from LLM output."""
+    if not raw:
+        return None
+    # 1. Strip markdown code fence if present
+    cleaned = raw.strip()
+    fence_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', cleaned, re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    else:
+        # Find outer braces
+        first_brace = cleaned.find('{')
+        last_brace = cleaned.rfind('}')
+        if first_brace != -1 and last_brace > first_brace:
+            cleaned = cleaned[first_brace:last_brace + 1].strip()
+
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 2. Regex fallback extraction for malformed JSON
+    out = {}
+    f_match = re.search(r'"factual(?:_score)?"\s*:\s*(\d{1,3})', raw, re.I)
+    r_match = re.search(r'"relevance(?:_score)?"\s*:\s*(\d{1,3})', raw, re.I)
+    c_match = re.search(r'"completeness(?:_score)?"\s*:\s*(\d{1,3})', raw, re.I)
+    s_match = re.search(r'"source_reliability(?:_score)?"\s*:\s*(\d{1,3})', raw, re.I)
+    cl_match = re.search(r'"clarity(?:_score)?"\s*:\s*(\d{1,3})', raw, re.I)
+    legacy_score = re.search(r'"score"\s*:\s*(\d{1,3})', raw, re.I)
+
+    if not any([f_match, r_match, c_match, s_match, cl_match, legacy_score]):
+        return None
+
+    if legacy_score and not f_match:
+        base_val = int(legacy_score.group(1))
+        out['factual_score'] = base_val
+        out['relevance_score'] = base_val
+        out['completeness_score'] = base_val
+        out['source_reliability_score'] = base_val
+        out['clarity_score'] = base_val
+    else:
+        out['factual_score'] = int(f_match.group(1)) if f_match else 50
+        out['relevance_score'] = int(r_match.group(1)) if r_match else 70
+        out['completeness_score'] = int(c_match.group(1)) if c_match else 60
+        out['source_reliability_score'] = int(s_match.group(1)) if s_match else 60
+        out['clarity_score'] = int(cl_match.group(1)) if cl_match else 70
+
+    crit_match = re.search(r'"has_critical_error"\s*:\s*(true|false)', raw, re.I)
+    out['has_critical_error'] = (crit_match.group(1).lower() == 'true') if crit_match else False
+
+    exp_match = re.search(r'"explanation"\s*:\s*"([^"]+)"', raw, re.I)
+    out['explanation'] = exp_match.group(1) if exp_match else "Extracted via pattern match"
+    out['issues'] = []
+    return out
+
+
 def _judge_chunk(user_query, answer_text, chunk, provider, now):
+    if chunk:
+        ref_text = f"Reference material (partial):\n{chunk}\n\n"
+    else:
+        ref_text = (
+            "Reference material:\n"
+            "[Self-contained / General reasoning query — no external search evidence was required. "
+            "Evaluate factual accuracy based on established consensus, mathematical/algorithmic correctness, and logical soundness. "
+            "For source_reliability_score, evaluate whether the reasoning is methodologically sound and internally grounded "
+            "rather than penalizing the absence of external citations.]\n\n"
+        )
     prompt = settings.render(
         'prompt_judge',
         date=f"{now:%Y-%m-%d}",
         year=now.year,
         question=user_query,
-        reference=(f"Reference material (partial):\n{chunk}\n\n" if chunk else ""),
+        reference=ref_text,
         answer=answer_text[:settings.get('judge_answer_char_limit')]
     )
     timeout_val = min(int(provider.get('timeout') or settings.get('judge_timeout_default')),
@@ -186,18 +257,51 @@ def _judge_chunk(user_query, answer_text, chunk, provider, now):
         resp = requests.post(
             provider['endpoint'],
             json={"model": provider['model_name'], "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.0, "stream": False},
+                  "temperature": 0.0, "stream": False, "max_tokens": 350},
             timeout=(10, timeout_val))
+
         if resp.status_code != 200:
             return None
         raw = strip_reasoning(resp.json()['choices'][0]['message'].get('content', ''))
-        print(f"[Judge raw]: {raw[:200]}")
-        s = re.search(r'"score"\s*:\s*(\d{1,3})', raw)
-        if not s:
+        parsed = _parse_judge_json(raw)
+        if not parsed:
             return None
-        rel = re.search(r'"relevant"\s*:\s*(true|false)', raw, re.IGNORECASE)
-        return {'score': max(0, min(100, int(s.group(1)))),
-                'relevant': (rel.group(1).lower() == 'true') if rel else True}
+
+        # Extract criterion scores (0-100 clamped)
+        factual = max(0, min(100, int(parsed.get('factual_score', 50))))
+        relevance = max(0, min(100, int(parsed.get('relevance_score', 50))))
+        completeness = max(0, min(100, int(parsed.get('completeness_score', 50))))
+        source_rel = max(0, min(100, int(parsed.get('source_reliability_score', 50))))
+        clarity = max(0, min(100, int(parsed.get('clarity_score', 50))))
+
+        # Compute weighted overall score
+        w_f = settings.get('weight_factual_accuracy') or 0.40
+        w_r = settings.get('weight_relevance') or 0.20
+        w_c = settings.get('weight_completeness') or 0.15
+        w_s = settings.get('weight_source_reliability') or 0.15
+        w_cl = settings.get('weight_clarity_consistency') or 0.10
+        chunk_score = int(round(w_f * factual + w_r * relevance + w_c * completeness + w_s * source_rel + w_cl * clarity))
+
+        raw_issues = parsed.get('issues', [])
+        if isinstance(raw_issues, str):
+            issues_list = [raw_issues.strip()] if raw_issues.strip() else []
+        elif isinstance(raw_issues, list):
+            issues_list = [str(x).strip() for x in raw_issues if str(x).strip()]
+        else:
+            issues_list = []
+
+        return {
+            'score': max(0, min(100, chunk_score)),
+            'factual_score': factual,
+            'relevance_score': relevance,
+            'completeness_score': completeness,
+            'source_reliability_score': source_rel,
+            'clarity_score': clarity,
+            'has_critical_error': bool(parsed.get('has_critical_error', False)),
+            'issues': issues_list,
+            'explanation': str(parsed.get('explanation', '')),
+            'relevant': (relevance >= 25)
+        }
     except Exception as e:
         print(f"[Judge chunk] failed: {e}")
         return None
@@ -205,7 +309,18 @@ def _judge_chunk(user_query, answer_text, chunk, provider, now):
 
 def evaluate_answer_accuracy(user_query, answer_text, context_text, judge_provider) -> dict:
     if not judge_provider or not judge_provider.get('endpoint'):
-        return {'score': 100, 'reason': 'No evaluator'}
+        return {
+            'score': 100,
+            'factual_score': 100,
+            'relevance_score': 100,
+            'completeness_score': 100,
+            'source_reliability_score': 100,
+            'clarity_score': 100,
+            'has_critical_error': False,
+            'issues': [],
+            'explanation': 'No evaluator configured',
+            'reason': 'No evaluator'
+        }
 
     now = datetime.now()
     snippets = _snippets_only(context_text)
@@ -215,51 +330,118 @@ def evaluate_answer_accuracy(user_query, answer_text, context_text, judge_provid
              + count_tokens(answer_text[:settings.get('judge_answer_char_limit')])
              + settings.get('judge_prompt_overhead_tokens'))
     chunk_budget = max(500, budget - fixed)
-    max_chunks = settings.get('judge_max_chunks')
-    chunks = pack_chunks(snippets, chunk_budget)[:max_chunks] if snippets else [""]
-    print(f"\n⚖️ [FALLBACK JUDGE REVIEW] Model: '{judge_provider.get('model_name')}' | Evaluating against {len(chunks)} search reference chunk(s) (chunk_budget={chunk_budget} tokens)...")
+    evidence_block = fit_to_budget(snippets, chunk_budget) if snippets else ""
+    print(f"\n⚖️ [FALLBACK JUDGE REVIEW] Model: '{judge_provider.get('model_name')}' | Evaluating against focused evidence block ({count_tokens(evidence_block)} tokens, budget={chunk_budget})...")
 
-    results = [r for r in map_chunks(
-        chunks, lambda c: _judge_chunk(user_query, answer_text, c, judge_provider, now)) if r]
+    judge_res = _judge_chunk(user_query, answer_text, evidence_block, judge_provider, now)
+    if not judge_res and evidence_block:
+        print(f"⚠️ [JUDGE RETRY] Initial evaluation call failed or timed out. Retrying with compact evidence slice...")
+        compact_block = fit_to_budget(snippets, 400)
+        judge_res = _judge_chunk(user_query, answer_text, compact_block, judge_provider, now)
+
+    results = [judge_res] if judge_res else []
+    
+    # Safe failure handling: Never auto-approve on judge failure
     if not results:
         print(f"❌ [FALLBACK JUDGE FAILED] Judge model did not return valid JSON evaluation.")
-        return {'score': 100, 'reason': 'Judge failed'}
+        return {
+            'score': 0,
+            'factual_score': 0,
+            'relevance_score': 0,
+            'completeness_score': 0,
+            'source_reliability_score': 0,
+            'clarity_score': 0,
+            'has_critical_error': True,
+            'issues': ['Evaluator call timed out or failed to return a valid structured quality evaluation'],
+            'explanation': 'Judge evaluation failed',
+            'reason': 'Judge failed'
+        }
 
     relevant = [r for r in results if r['relevant']]
     if not relevant:
-        print(f"🚨 [FALLBACK JUDGE] No chunks marked relevant by {judge_provider.get('model_name')}. Grounding failed (score=0).")
-        return {'score': 0, 'reason': 'Evaluated'}
+        relevant = results  # Fall back to all results if chunk relevance was ambiguous
 
-    mean = sum(r['score'] for r in relevant) / len(relevant)
-    cut = settings.get('judge_contradiction_cutoff')
-    cap = settings.get('judge_contradiction_cap')
-    score = int(min(mean, cap)) if min(r['score'] for r in relevant) < cut else int(mean)
+    # 1. Compute criterion averages across evaluated chunks
+    avg_factual = int(sum(r['factual_score'] for r in relevant) / len(relevant))
+    avg_relevance = int(sum(r['relevance_score'] for r in relevant) / len(relevant))
+    avg_completeness = int(sum(r['completeness_score'] for r in relevant) / len(relevant))
+    avg_source_rel = int(sum(r['source_reliability_score'] for r in relevant) / len(relevant))
+    avg_clarity = int(sum(r['clarity_score'] for r in relevant) / len(relevant))
+    has_critical_error = any(r.get('has_critical_error') for r in relevant)
 
-    kw = '|'.join(re.escape(k) for k in settings.get_list('judge_current_keywords'))
-    if re.search(rf'\b({kw})\b', user_query, re.IGNORECASE):
-        for ym in re.finditer(r'\bas of (?:[A-Za-z]+\s+)?(20\d{2})\b', answer_text, re.IGNORECASE):
-            if int(ym.group(1)) < now.year:
-                print(f"⚠️ [JUDGE OUTDATED PENALTY] Detected outdated year {ym.group(1)} < {now.year}. Capping score.")
-                score = min(score, settings.get('judge_outdated_cap'))
-                break
+    collected_issues = []
+    for r in relevant:
+        collected_issues.extend(r.get('issues', []))
 
-    # Parroting check: if the answer merely echoed raw search snippet metadata format
-    if re.search(r'\[\d+\]\s*(?:Title|Summary|Source)\s*:', answer_text, re.IGNORECASE) or 'Summary: Read full articles' in answer_text:
-        print("⚠️ [JUDGE PARROTING PENALTY] Answer merely echoed raw search snippet metadata format. Capping score.")
-        score = min(score, settings.get('judge_parroting_cap'))
+    # 2. Objective Fact Verification Checks
+    # (a) Temporal / Outdated Year check
+    is_outdated, out_msg = verify_temporal_consistency(user_query, answer_text, now.year)
+    if is_outdated:
+        print(f"⚠️ [JUDGE OUTDATED PENALTY] {out_msg}")
+        avg_factual = min(avg_factual, settings.get('judge_outdated_cap'))
+        has_critical_error = True
+        collected_issues.append(out_msg)
 
-    # Check if numbers cited in the answer exist in reference snippets
+    # (b) Number / Metric Verification check against snippets
     if snippets:
-        nums = {n.replace(',', '') for n in re.findall(r'\b\d[\d,]{2,}\b', answer_text or '')}
-        if nums:
-            ctx_clean = snippets.replace(',', '')
-            found_ratio = sum(n in ctx_clean for n in nums) / len(nums)
-            if found_ratio == 0.0:
-                print(f"⚠️ [JUDGE NUMBER CHECK] None of the {len(nums)} numbers {nums} found in snippets. Capping score.")
-                score = min(score, settings.get('judge_contradiction_cap'))
+        match_ratio, unverified_nums = verify_number_consistency(answer_text, snippets, user_query=user_query)
+        if unverified_nums and match_ratio == 0.0:
+            print(f"⚠️ [JUDGE NUMBER CHECK] None of the cited numbers {unverified_nums} found in snippets. Capping score.")
+            avg_factual = min(avg_factual, settings.get('judge_contradiction_cap'))
+            has_critical_error = True
+            collected_issues.append(f"Unverified figures not found in evidence: {', '.join(unverified_nums[:5])}")
+        elif unverified_nums and match_ratio < 0.5:
+            print(f"⚠️ [JUDGE NUMBER CHECK] Low number grounding ratio ({match_ratio:.2f}).")
+            avg_factual = min(avg_factual, 50)
+            collected_issues.append(f"Partially unverified figures: {', '.join(unverified_nums[:3])}")
+    else:
+        # For self-contained queries without external snippets, align source reliability with factual correctness
+        avg_source_rel = max(avg_source_rel, avg_factual)
 
-    print(f"📊 [FALLBACK JUDGE ACCURACY] Evaluated by '{judge_provider['model_name']}' -> Final Quality Score: {score}/100 ({len(relevant)}/{len(chunks)} chunk(s) relevant)")
-    return {'score': score, 'reason': 'Evaluated'}
+    # (c) Parroting check
+    if re.search(r'\[\d+\]\s*(?:Title|Summary|Source)\s*:', answer_text, re.IGNORECASE) or 'Summary: Read full articles' in answer_text:
+        print("⚠️ [JUDGE PARROTING PENALTY] Answer merely echoed raw search snippet metadata format.")
+        avg_clarity = min(avg_clarity, settings.get('judge_parroting_cap'))
+        avg_factual = min(avg_factual, 35)
+        has_critical_error = True
+        collected_issues.append("Answer merely echoed raw search snippet metadata format without synthesis")
+
+    # If factual grounding is low (< 40%), flag critical error
+    if avg_factual < 40:
+        has_critical_error = True
+
+    # 3. Calculate Final Overall Score consistently from weighted criteria
+    w_f = settings.get('weight_factual_accuracy') or 0.40
+    w_r = settings.get('weight_relevance') or 0.20
+    w_c = settings.get('weight_completeness') or 0.15
+    w_s = settings.get('weight_source_reliability') or 0.15
+    w_cl = settings.get('weight_clarity_consistency') or 0.10
+    final_score = int(round(
+        w_f * avg_factual +
+        w_r * avg_relevance +
+        w_c * avg_completeness +
+        w_s * avg_source_rel +
+        w_cl * avg_clarity
+    ))
+    final_score = max(0, min(100, final_score))
+
+    # Deduplicate issues preserving order
+    dedup_issues = list(dict.fromkeys(collected_issues))
+    explanation = relevant[0].get('explanation', '') if relevant else 'Evaluation complete'
+
+    print(f"📊 [FALLBACK JUDGE ACCURACY] Evaluated by '{judge_provider['model_name']}' -> Final Quality Score: {final_score}/100 | Factual: {avg_factual}% | Relevance: {avg_relevance}% | Completeness: {avg_completeness}% | Sources: {avg_source_rel}% | Clarity: {avg_clarity}% | Critical Error: {has_critical_error}")
+    return {
+        'score': final_score,
+        'factual_score': avg_factual,
+        'relevance_score': avg_relevance,
+        'completeness_score': avg_completeness,
+        'source_reliability_score': avg_source_rel,
+        'clarity_score': avg_clarity,
+        'has_critical_error': has_critical_error,
+        'issues': dedup_issues,
+        'explanation': explanation,
+        'reason': 'Evaluated'
+    }
 
 
 def get_failover_provider_candidates(requested_model=None):
@@ -298,11 +480,19 @@ def get_failover_provider_candidates(requested_model=None):
         else:
             _provider_cooldowns.pop(primary_provider['id'], None)
 
-    # 2. Designated Single Fallback candidate: match fallback_model from database and must be active
+    # 2. Designated Single Fallback candidate: match fallback_model or secondary_model or next active provider
     fallback_provider = None
+    if not fallback_model:
+        fallback_model = db.get_system_config('secondary_model') or ''
     if fallback_model:
         fallback_provider = next(
             (p for p in providers if p.get('model_name') == fallback_model and p.get('is_active') and p.get('id') != (primary_provider.get('id') if primary_provider else None)),
+            None
+        )
+    if not fallback_provider and primary_provider:
+        # Fall back to any active provider different from primary to ensure two-tier fallback pipeline
+        fallback_provider = next(
+            (p for p in providers if p.get('is_active') and p.get('id') != primary_provider.get('id')),
             None
         )
 
@@ -321,22 +511,47 @@ def get_failover_provider_candidates(requested_model=None):
     return candidates
 
 
-def build_fallback_messages(conversation, new_search_results):
+def build_fallback_messages(conversation, new_search_results, deficiencies=None):
     """Purano search system msg bad, notun search ta LAST user message e embed (history er shuru e na)."""
     msgs = []
+    original_search_content = ""
     for m in conversation:
         c = m.get('content', '') or ''
         if m.get('role') == 'system' and SEARCH_ID in c:
+            original_search_content = c
             continue
         msgs.append(dict(m))
 
+    correction_block = ""
+    if deficiencies:
+        issues_text = "\n".join(f"- {issue}" for issue in deficiencies if issue)
+        if issues_text:
+            correction_block = (
+                f"\n\n[MANDATORY CORRECTION INSTRUCTIONS FOR FALLBACK ANSWER]:\n"
+                f"An initial draft answer was rejected due to the following specific deficiencies:\n"
+                f"{issues_text}\n"
+                f"Your task: Correct every one of these deficiencies. Discard any ungrounded assertions. "
+                f"Ground all facts strictly in the verified context. If facts are absent, clearly acknowledge the uncertainty."
+            )
+
+    evidence_to_embed = ""
     if new_search_results:
-        raw = "\n\n".join(s['content'] for s in new_search_results)
-        snippets, _, instr = raw.partition(SEARCH_MARK)
+        evidence_to_embed = "\n\n".join(s['content'] for s in new_search_results)
+    elif original_search_content:
+        evidence_to_embed = original_search_content
+
+    if evidence_to_embed:
+        snippets, _, instr = evidence_to_embed.partition(SEARCH_MARK)
         for i in range(len(msgs) - 1, -1, -1):
             if msgs[i].get('role') == 'user':
                 msgs[i]['content'] = (f"{snippets.strip()}{USER_SEP}{msgs[i]['content']}"
+                                      f"{correction_block}"
                                       f"\n\n{SEARCH_MARK}{instr}")
+                break
+    elif correction_block:
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get('role') == 'user':
+                msgs[i]['content'] = f"{msgs[i]['content']}{correction_block}"
                 break
     return msgs
 
@@ -354,6 +569,41 @@ def build_sources_list(sd):
         if s['url'] not in seen:
             out.append(s); seen.add(s['url'])
     return out
+
+
+def is_candidate_better(cand, base):
+    """
+    Compares candidate evaluation dictionaries or candidate objects.
+    Returns True if cand is strictly better than base.
+    Comparison criteria (in priority order):
+    1. Critical error elimination (critical error in base, none in cand).
+    2. Critical error introduction (critical error in cand, none in base -> False).
+    3. Factual correctness score.
+    4. Overall evaluation score.
+    """
+    if not cand:
+        return False
+    if not base:
+        return True
+
+    c_eval = cand.get('eval') if isinstance(cand, dict) and 'eval' in cand and isinstance(cand.get('eval'), dict) else cand
+    b_eval = base.get('eval') if isinstance(base, dict) and 'eval' in base and isinstance(base.get('eval'), dict) else base
+
+    c_crit = c_eval.get('has_critical_error', False)
+    b_crit = b_eval.get('has_critical_error', False)
+    if b_crit and not c_crit:
+        return True
+    if not b_crit and c_crit:
+        return False
+
+    c_fact = c_eval.get('factual_score', 0)
+    b_fact = b_eval.get('factual_score', 0)
+    if c_fact > b_fact:
+        return True
+    if c_fact < b_fact:
+        return False
+
+    return c_eval.get('score', 0) > b_eval.get('score', 0)
 
 
 class Backend_Api:
@@ -571,18 +821,24 @@ class Backend_Api:
             # Add past history
             conversation.extend(history)
 
-            # Stage 3 (Conditional): If internet access is enabled, fetch web search results
+            # Stage 3 (Conditional): If internet access is enabled, dynamically evaluate retrieval need
             search_sources_dict = None
             if internet_access:
-                status_3 = get_dynamic_status('searching_web', user_prompt_text)
-                yield f"data: {json.dumps({'type': 'status', 'stage': 'searching_web', 'text': status_3})}\n\n"
-                current_date = datetime.now().strftime("%Y-%m-%d")
-                query = f'Current date: {current_date}. ' + user_prompt_text
-                print(f"\n🌐 [SEARCH 1] Searching web via DuckDuckGo + Wikipedia for: '{user_prompt_text}'")
-                search_results, search_sources_dict = fetch_search_results(query, return_sources=True)
-                links_found = len(search_sources_dict.get('all', [])) if search_sources_dict else 0
-                print(f"✅ [SEARCH 1 DONE] Retrieved {len(search_results)} search context block(s) with {links_found} source link(s).")
-                conversation.extend(search_results)
+                needs_web, strat_reason = determine_query_evidence_need(user_prompt_text, has_active_files=bool(active_file_ids))
+                if needs_web:
+                    status_3 = get_dynamic_status('searching_web', user_prompt_text)
+                    yield f"data: {json.dumps({'type': 'status', 'stage': 'searching_web', 'text': status_3})}\n\n"
+                    # Resolve multi-turn coreference if this is a follow-up
+                    search_prompt = resolve_search_coreference(user_prompt_text, history)
+                    current_date = datetime.now().strftime("%Y-%m-%d")
+                    query = f'Current date: {current_date}. ' + search_prompt
+                    print(f"\n🌐 [SEARCH 1] Searching web via DuckDuckGo + Wikipedia for: '{search_prompt}' (strategy: {strat_reason})")
+                    search_results, search_sources_dict = fetch_search_results(query, return_sources=True)
+                    links_found = len(search_sources_dict.get('all', [])) if search_sources_dict else 0
+                    print(f"✅ [SEARCH 1 DONE] Retrieved {len(search_results)} search context block(s) with {links_found} source link(s).")
+                    conversation.extend(search_results)
+                else:
+                    print(f"\n⚡ [DYNAMIC EVIDENCE STRATEGY] Query identified as '{strat_reason}'. External search bypassed to preserve context purity & speed.")
 
             # Build final prompt content with file context embedded directly
             final_prompt_content = user_prompt_text
@@ -875,13 +1131,24 @@ class Backend_Api:
                                 eval_result = evaluate_answer_accuracy(user_prompt_text, full_primary_text,
                                                                        ref_context, judge_provider)
                                 accuracy_score = eval_result['score']
-                                judged = eval_result['reason'] == 'Evaluated'
+                                judged = (eval_result['reason'] == 'Evaluated')
+                                has_critical_error = eval_result.get('has_critical_error', False)
+                                min_accuracy_threshold = settings.get('min_answer_accuracy_threshold')  # 60%
 
-                                if (eval_result['reason'] == 'Judge failed') or (judged and accuracy_score >= min_accuracy_threshold):
+                                # Primary acceptable condition:
+                                # Must be judged, score >= 60, no critical errors, and factual score >= 50.
+                                # Never auto-approve on judge failure!
+                                is_primary_acceptable = (
+                                    judged
+                                    and accuracy_score >= min_accuracy_threshold
+                                    and not has_critical_error
+                                    and eval_result.get('factual_score', 100) >= 50
+                                )
+
+                                if is_primary_acceptable:
                                     print(f"✅ [QUALITY GATE PASSED] Accuracy: {accuracy_score}% >= Threshold: {min_accuracy_threshold}%. Directly releasing buffered Primary answer to UI!")
-                                    if judged:
-                                        final_confidence = accuracy_score
-                                        final_mode = 'verified'
+                                    final_confidence = accuracy_score
+                                    final_mode = 'verified'
                                     for c in primary_buffer:
                                         assistant_accumulated.append(c)
                                         yield f"data: {json.dumps({'type': 'content', 'delta': c})}\n\n"
@@ -890,55 +1157,156 @@ class Backend_Api:
                                         _provider_cooldowns.pop(provider['id'], None)
                                     break
 
-                                # [5]-[7] score < threshold
-                                print(f"🚨 [QUALITY GATE FAILED] Score: {accuracy_score}% < Threshold: {min_accuracy_threshold}%. Primary answer rejected!")
-                                print(f"🔄 [RE-SEARCH TRIGGERED] Fallback initiated! Re-searching web with '{settings.get('fallback_search_engine')}'...")
+                                # Trigger Fallback path
+                                deficiencies = eval_result.get('issues', [])
+                                print(f"🚨 [QUALITY GATE FAILED] Score: {accuracy_score}% (Threshold: {min_accuracy_threshold}% | Critical Error: {has_critical_error}). Deficiencies: {deficiencies}")
+                                print(f"🔄 [RE-SEARCH & FALLBACK TRIGGERED] Re-verifying evidence and generating corrected answer...")
                                 yield f"data: {json.dumps({'type': 'status', 'stage': 'researched_fallback', 'text': get_dynamic_status('researched_fallback', user_prompt_text)})}\n\n"
 
-                                re_query = f"{user_prompt_text} {datetime.now():%B %d %Y}"
-                                print(f"🔍 [RE-SEARCH QUERY] '{re_query}'")
-                                new_results, new_sources = fetch_search_results(
-                                    re_query, return_sources=True, engine=settings.get('fallback_search_engine')
-                                )
-                                print(f"✅ [RE-SEARCH DONE] Retrieved {len(new_results)} fresh context block(s).")
-                                if new_sources:
-                                    search_sources_dict = new_sources
+                                # Check evidence sufficiency: if factual score was low or no search context existed, do targeted re-search
+                                new_results = []
+                                if internet_access:
+                                    clean_q = clean_search_query(user_prompt_text)
+                                    if is_time_sensitive_query(user_prompt_text):
+                                        re_query = f"{clean_q} {datetime.now():%Y}"
+                                    else:
+                                        re_query = clean_q
+                                    print(f"🔍 [RE-SEARCH QUERY] '{re_query}'")
+                                    new_results, new_sources = fetch_search_results(
+                                        re_query, return_sources=True, engine=settings.get('fallback_search_engine')
+                                    )
+                                    print(f"✅ [RE-SEARCH DONE] Retrieved {len(new_results)} fresh context block(s).")
+                                    if new_sources and (new_sources.get('all') or new_sources.get('wikipedia')):
+                                        if search_sources_dict:
+                                            existing_urls = {s.get('url') for s in search_sources_dict.get('all', []) if s.get('url')}
+                                            for ns in new_sources.get('all', []):
+                                                if ns.get('url') and ns.get('url') not in existing_urls:
+                                                    search_sources_dict['all'].append(ns)
+                                                    existing_urls.add(ns.get('url'))
+                                            if new_sources.get('wikipedia'):
+                                                search_sources_dict['wikipedia'] = new_sources['wikipedia']
+                                        else:
+                                            search_sources_dict = new_sources
 
-                                fb_conv = build_fallback_messages(conversation, new_results)
+                                # Build fallback messages containing question, evidence, and specific deficiencies to fix
+                                fb_conv = build_fallback_messages(conversation, new_results, deficiencies=deficiencies)
                                 fb_tokens = count_messages_tokens(fb_conv)
                                 fb_budget = get_budget(fallback_provider_candidate)
-                                print(f"📏 [FALLBACK CONTEXT CHECK] Fallback Model: '{fallback_provider_candidate.get('model_name')}' | Re-search Tokens: {fb_tokens} | Budget Window: {fb_budget}")
+                                print(f"📏 [FALLBACK CONTEXT CHECK] Fallback Model: '{fallback_provider_candidate.get('model_name') if fallback_provider_candidate else 'None'}' | Re-search Tokens: {fb_tokens} | Budget Window: {fb_budget}")
                                 if context_overflows(fb_conv, fallback_provider_candidate):
-                                    print(f"⚠️ [FALLBACK CHUNKING] Re-search context ({fb_tokens} tokens) > Fallback Budget ({fb_budget} tokens)! Chunking for Fallback...")
+                                    print(f"⚠️ [FALLBACK CHUNKING] Re-search context overflows Fallback budget. Chunking...")
                                     yield f"data: {json.dumps({'type': 'status', 'stage': 'chunking_context', 'text': get_dynamic_status('chunking_context', user_prompt_text)})}\n\n"
-                                else:
-                                    print(f"✨ [FALLBACK CONTEXT OK] Re-search context fits inside Fallback window. No chunking needed.")
                                 fb_msgs = prepare_messages(fb_conv, fallback_provider_candidate, user_prompt_text)
 
-                                print(f"🚀 [FALLBACK GENERATION] Calling Fallback LLM '{fallback_provider_candidate.get('model_name')}' to generate final accurate answer...")
+                                print(f"🚀 [FALLBACK GENERATION] Calling Fallback LLM '{fallback_provider_candidate.get('model_name') if fallback_provider_candidate else 'None'}' to generate corrected answer...")
                                 try:
                                     fb_answer = generate_text(fallback_provider_candidate, fb_msgs)
-                                    print(f"✅ [FALLBACK GENERATION DONE] Generated {len(fb_answer)} chars. Streaming to UI with verified confidence score...")
+                                    print(f"✅ [FALLBACK GENERATION DONE] Generated {len(fb_answer)} chars. Evaluating fallback quality...")
                                 except Exception as e:
                                     print(f"❌ [FALLBACK GENERATION FAILED] {e}")
                                     fb_answer = ""
 
+                                # Evaluate the Fallback answer using the same 5-criterion rubric
+                                fb_eval = None
+                                fb_score = 0
                                 if fb_answer.strip():
-                                    final_text = fb_answer
                                     verifying_text = random.choice(settings.get_list('status_verifying'))
                                     yield f"data: {json.dumps({'type': 'status', 'stage': 'evaluating_quality', 'text': verifying_text})}\n\n"
-                                    new_ctx = "\n\n".join(s['content'] for s in new_results)
-                                    verify = evaluate_answer_accuracy(user_prompt_text, fb_answer, new_ctx, judge_provider)
-                                    if verify.get('reason') == 'Evaluated':
-                                        final_confidence = verify['score']
-                                        final_mode = 'verified' if verify['score'] >= min_accuracy_threshold else 'low_confidence'
-                                    else:
-                                        final_confidence = int(settings.get('fallback_confidence_default') or 85)
-                                        final_mode = 'verified'
+                                    fallback_ref_context = ref_context
+                                    if new_results:
+                                        fallback_ref_context += "\n\n" + "\n\n".join(s['content'] for s in new_results)
+
+                                    fb_eval = evaluate_answer_accuracy(user_prompt_text, fb_answer, fallback_ref_context, judge_provider)
+                                    fb_score = fb_eval.get('score', 0)
+                                    print(f"📊 [FALLBACK EVALUATION RESULT] Score: {fb_score}/100 (Target: 75%) | Issues: {fb_eval.get('issues', [])}")
+
+                                    # Bounded Improvement Cycle: If score < 75% and deficiencies exist, run up to 1 targeted refinement round
+                                    target_accuracy = settings.get('target_final_accuracy') or 75
+                                    max_retries = settings.get('max_fallback_retries') or 1
+                                    if fb_score < target_accuracy and fb_eval.get('issues') and max_retries > 0:
+                                        print(f"🔄 [BOUNDED REFINEMENT] Score {fb_score}% < {target_accuracy}%. Executing 1 bounded refinement round targeting: {fb_eval['issues']}")
+                                        refine_msgs = build_fallback_messages(conversation, new_results, deficiencies=fb_eval.get('issues', []))
+                                        refine_msgs.append({'role': 'assistant', 'content': fb_answer})
+                                        refine_msgs.append({
+                                            'role': 'user',
+                                            'content': (
+                                                f"Your previous response had the following identified deficiencies:\n"
+                                                + "\n".join(f"- {i}" for i in fb_eval.get('issues', []))
+                                                + "\nPlease provide a fully factual, corrected final answer adhering strictly to the verified context."
+                                            )
+                                        })
+                                        refine_prep = prepare_messages(refine_msgs, fallback_provider_candidate, user_prompt_text)
+                                        try:
+                                            refined_answer = generate_text(fallback_provider_candidate, refine_prep)
+                                            if refined_answer.strip():
+                                                refined_eval = evaluate_answer_accuracy(user_prompt_text, refined_answer, fallback_ref_context, judge_provider)
+                                                if is_candidate_better(refined_eval, fb_eval):
+                                                    print(f"✅ [REFINEMENT SUCCEEDED] Improved quality: {fb_score}% -> {refined_eval['score']}% (Factual: {fb_eval.get('factual_score')}% -> {refined_eval.get('factual_score')}%)")
+                                                    fb_answer = refined_answer
+                                                    fb_score = refined_eval['score']
+                                                    fb_eval = refined_eval
+                                                else:
+                                                    print(f"⚠️ [REFINEMENT NO GAIN] Refined answer did not resolve deficiencies or improve accuracy. Retaining best previous candidate.")
+                                        except Exception as r_err:
+                                            print(f"[Refinement note]: {r_err}")
+
+                                # Build candidates for primary and fallback
+                                candidate_primary = {
+                                    'text': full_primary_text,
+                                    'eval': eval_result,
+                                    'score': accuracy_score,
+                                    'factual_score': eval_result.get('factual_score', 0),
+                                    'has_critical_error': has_critical_error,
+                                    'is_evaluated': judged
+                                }
+                                candidate_fallback = {
+                                    'text': fb_answer,
+                                    'eval': fb_eval,
+                                    'score': fb_score,
+                                    'factual_score': fb_eval.get('factual_score', 0) if fb_eval else 0,
+                                    'has_critical_error': fb_eval.get('has_critical_error', True) if fb_eval else True,
+                                    'is_evaluated': bool(fb_eval and fb_eval.get('reason') == 'Evaluated')
+                                }
+
+                                # Select best candidate using is_candidate_better
+                                if candidate_fallback['text'].strip() and is_candidate_better(candidate_fallback, candidate_primary):
+                                    best_candidate = candidate_fallback
+                                    print(f"🏆 [FINAL CANDIDATE] Selected Fallback answer (Score: {best_candidate['score']}%, Critical: {best_candidate['has_critical_error']})")
                                 else:
-                                    final_text = full_primary_text
-                                    final_confidence = accuracy_score
-                                    final_mode = 'low_confidence'
+                                    best_candidate = candidate_primary
+                                    print(f"🏆 [FINAL CANDIDATE] Selected Primary answer (Score: {best_candidate['score']}%, Critical: {best_candidate['has_critical_error']})")
+
+                                # Verify if best candidate meets acceptance threshold
+                                is_acceptable = (
+                                    best_candidate.get('is_evaluated', False)
+                                    and best_candidate.get('score', 0) >= min_accuracy_threshold
+                                    and not best_candidate.get('has_critical_error', False)
+                                    and best_candidate.get('factual_score', 0) >= 50
+                                )
+
+                                raw_text = best_candidate['text']
+                                if is_acceptable:
+                                    final_text = raw_text
+                                    final_confidence = best_candidate['score']
+                                    final_mode = 'verified'
+                                else:
+                                    # Fallback could not fully resolve issues or score < threshold
+                                    disclaimer = (
+                                        "> ⚠️ **Notice: Insufficient Verification** — "
+                                        "This response could not be fully verified against reliable sources and may contain inaccuracies. "
+                                        "Please cross-check critical information.\n\n"
+                                    )
+                                    if not raw_text.startswith("> ⚠️ **Notice: Insufficient Verification**"):
+                                        final_text = disclaimer + raw_text
+                                    else:
+                                        final_text = raw_text
+
+                                    if best_candidate.get('is_evaluated', False):
+                                        final_confidence = best_candidate['score']
+                                        final_mode = 'low_confidence'
+                                    else:
+                                        final_confidence = None
+                                        final_mode = 'unverified'
 
                                 step = settings.get('stream_piece_chars')
                                 for i in range(0, len(final_text), step):
@@ -1209,37 +1577,53 @@ def build_messages(jailbreak):
 
 def fetch_wikipedia_summary(query: str):
     """
-    Fetches encyclopedic summary from Wikipedia OpenSearch and REST API.
+    Fetches encyclopedic summary from Wikipedia OpenSearch, Search API, and REST API.
     """
     try:
         import urllib.parse
-        clean_q = re.sub(r'^Current date: \d{4}-\d{2}-\d{2}\.\s*', '', query).strip()
-        # Clean question prefixes like 'who is', 'what is', 'tell me about'
-        clean_q = re.sub(r'^(?:who|what|where|tell me about|explain)\s+(?:is|was|are|the|a)?\s*', '', clean_q, flags=re.IGNORECASE).strip()
+        clean_q = clean_search_query(query)
         if not clean_q or len(clean_q) < 3:
             return None
 
-        wiki_timeout = settings.get('wiki_timeout')
-        wiki_ua = settings.get('wiki_user_agent')
+        wiki_timeout = settings.get('wiki_timeout') or 4
+        wiki_ua = settings.get('wiki_user_agent') or 'SahajAI/1.0'
         headers = {'User-Agent': f'{wiki_ua} (contact@sahaj.ai; https://sahaj.ai)'}
-        search_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(clean_q)}&limit=1&namespace=0&format=json"
+
+        title = None
+        url = None
+
+        # 1. Try OpenSearch first
+        search_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(clean_q)}&limit=2&namespace=0&format=json"
         res = requests.get(search_url, headers=headers, timeout=wiki_timeout)
         if res.status_code == 200:
             data = res.json()
             if len(data) >= 4 and data[1] and data[3]:
                 title = data[1][0]
                 url = data[3][0]
-                summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
-                sum_res = requests.get(summary_url, headers=headers, timeout=wiki_timeout)
-                if sum_res.status_code == 200:
-                    extract = sum_res.json().get('extract', '')
-                    if extract:
-                        return {
-                            'title': f"Wikipedia: {title}",
-                            'body': extract,
-                            'url': url,
-                            'source': 'Wikipedia'
-                        }
+
+        # 2. If OpenSearch did not return a match (e.g. for multi-word or complex queries), try Search API
+        if not title:
+            sr_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(clean_q)}&format=json&utf8=1&srlimit=1"
+            res_sr = requests.get(sr_url, headers=headers, timeout=wiki_timeout)
+            if res_sr.status_code == 200:
+                sr_data = res_sr.json()
+                search_hits = sr_data.get('query', {}).get('search', [])
+                if search_hits:
+                    title = search_hits[0].get('title')
+                    url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+
+        if title:
+            summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+            sum_res = requests.get(summary_url, headers=headers, timeout=wiki_timeout)
+            if sum_res.status_code == 200:
+                extract = sum_res.json().get('extract', '')
+                if extract:
+                    return {
+                        'title': f"Wikipedia: {title}",
+                        'body': extract,
+                        'url': url,
+                        'source': 'Wikipedia'
+                    }
     except Exception as e:
         print(f"[Wikipedia Search Note] {e}")
     return None
@@ -1251,7 +1635,7 @@ def fetch_search_results(query, return_sources=False, engine='auto'):
 
     :param query: Search query string  
     :param return_sources: If True, returns a tuple of (messages_list, sources_dict)
-    :param engine: Search engine/backend ('auto', 'bing', etc.)
+    :param engine: Search engine/backend ('auto', 'duckduckgo', etc.)
     :return: List of search results (or tuple if return_sources=True)  
     """
     sources_collected = {'wikipedia': None, 'duckduckgo': None, 'all': []}
@@ -1262,16 +1646,19 @@ def fetch_search_results(query, return_sources=False, engine='auto'):
             from duckduckgo_search import DDGS
 
         results = []
-        clean_q = re.sub(r'^Current date: \d{4}-\d{2}-\d{2}\.\s*', '', query).strip()
+        clean_q = clean_search_query(query)
         q_lower = query.lower()
         is_news_query = any(k in q_lower for k in settings.get_list('news_keywords'))
         is_weather_or_finance = any(k in q_lower for k in settings.get_list('live_data_keywords'))
-        kwargs = {} if engine == 'auto' else {'backend': engine}
 
-        # 1. Fetch DuckDuckGo results (news if requested, else general text)
+        # If engine was set to 'bing', handle honestly without claiming fake provider
+        if engine and engine.lower() == 'bing':
+            print("[Search Provider Notice] Bing API backend not configured in environment. Using DuckDuckGo Search provider.")
+
+        # 1. Fetch DuckDuckGo results (news if requested or live events, else general text)
         with DDGS() as ddgs:
             if is_news_query:
-                news_q = re.sub(r'\b(headlines?|today)\b', '', clean_q, flags=re.I).strip() or "breaking news"
+                news_q = re.sub(r'\b(headlines?|today)\b', '', clean_q, flags=re.I).strip() or clean_q
                 try:
                     results = list(ddgs.news(news_q, max_results=settings.get('search_news_max_results')))
                 except Exception:
@@ -1281,42 +1668,10 @@ def fetch_search_results(query, return_sources=False, engine='auto'):
                         results = []
             if not results:
                 try:
-                    results = list(ddgs.text(clean_q, max_results=settings.get('search_text_max_results'), **kwargs))
-                except TypeError:
-                    try:
-                        results = list(ddgs.text(clean_q, max_results=settings.get('search_text_max_results')))
-                    except Exception:
-                        results = []
-                except Exception:
+                    results = list(ddgs.text(clean_q, max_results=settings.get('search_text_max_results')))
+                except Exception as de:
+                    print(f"[DDG text search note]: {de}")
                     results = []
-
-        # Filter out generic portal directory descriptions if substantive results exist
-        def _is_generic_portal(body_text):
-            b_low = (body_text or '').lower()
-            return ('read full articles, watch videos' in b_low or
-                    'browse thousands of titles' in b_low or
-                    'get breaking news stories and in-depth coverage' in b_low)
-
-        filtered = [r for r in results if not _is_generic_portal(r.get('body') or r.get('snippet'))]
-        if filtered:
-            results = filtered
-
-        # Find first valid DuckDuckGo web result
-        for r in results:
-            r_url = r.get("url") or r.get("href")
-            r_title = r.get("title") or r.get("source") or "DuckDuckGo Web Search"
-            if r_url and r_url.startswith("http"):
-                sources_collected['duckduckgo'] = {'title': r_title, 'url': r_url}
-                break
-
-        # If no direct DDG search link found, construct dedicated fallback search link
-        if not sources_collected['duckduckgo']:
-            import urllib.parse
-            encoded_q = urllib.parse.quote(clean_q)
-            sources_collected['duckduckgo'] = {
-                'title': f"DuckDuckGo Search: {clean_q[:40]}",
-                'url': f"https://duckduckgo.com/?q={encoded_q}"
-            }
 
         # 2. Fetch Wikipedia encyclopedic context
         wiki_data = None
@@ -1326,15 +1681,17 @@ def fetch_search_results(query, return_sources=False, engine='auto'):
             # Place Wikipedia article at the top of context for strong factual anchor
             results.insert(0, wiki_data)
             sources_collected['wikipedia'] = {'title': wiki_data['title'], 'url': wiki_data['url']}
-        elif not (is_news_query or is_weather_or_finance):
-            # Dedicated Wikipedia search fallback link
-            import urllib.parse
-            clean_term = re.sub(r'^(?:who|what|where|tell me about|explain)\s+(?:is|was|are|the|a)?\s*', '', clean_q, flags=re.IGNORECASE).strip()
-            encoded_wiki = urllib.parse.quote(clean_term or clean_q)
-            sources_collected['wikipedia'] = {
-                'title': f"Wikipedia: {(clean_term or clean_q)[:40]}",
-                'url': f"https://en.wikipedia.org/w/index.php?search={encoded_wiki}"
-            }
+
+        # Rank and filter results by query relevance and noise/boilerplate removal
+        results = rank_and_filter_search_results(clean_q, results)
+
+        # Record first genuine DuckDuckGo web result
+        for r in results:
+            r_url = r.get("url") or r.get("href")
+            r_title = r.get("title") or r.get("source") or "DuckDuckGo Web Search"
+            if r_url and r_url.startswith("http") and "wikipedia.org" not in r_url:
+                sources_collected['duckduckgo'] = {'title': r_title, 'url': r_url}
+                break
 
         if not results:
             if return_sources:
@@ -1342,17 +1699,22 @@ def fetch_search_results(query, return_sources=False, engine='auto'):
             return []
 
         snippets = ""
-        citation_examples = []
+        seen_urls = set()
         for index, result in enumerate(results):
-            body = result.get("body", "") or result.get("snippet", "")
-            href = result.get("url", "") or result.get("href", "")
-            title = result.get("title", "")
-            source = result.get("source", "")
+            body = (result.get("body") or result.get("snippet") or "").strip()
+            href = result.get("url") or result.get("href") or ""
+            title = (result.get("title") or "").strip()
+            source = result.get("source") or ("Wikipedia" if "wikipedia.org" in href else "")
+            date_info = result.get("date") or ""
+            if href in seen_urls:
+                continue
+            if href:
+                seen_urls.add(href)
             if body or title:
-                snippets += f"[{index + 1}] Title: {title}\nSummary: {body}\nSource: {source}\nURL: {href}\n\n"
+                date_line = f"Date: {date_info}\n" if date_info else ""
+                snippets += f"[{index + 1}] Title: {title}\n{date_line}Summary: {body}\nSource: {source}\nURL: {href}\n\n"
                 clean_src = source if source else title
                 if href:
-                    citation_examples.append(f"[{clean_src}]({href})")
                     sources_collected['all'].append({'title': clean_src, 'url': href})
 
         if not snippets.strip():

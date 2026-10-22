@@ -117,6 +117,7 @@ def init_db():
                     title VARCHAR(255) NOT NULL DEFAULT 'New Conversation',
                     model VARCHAR(100) DEFAULT 'mistral:latest',
                     jailbreak VARCHAR(50) DEFAULT 'default',
+                    is_pinned BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -279,6 +280,12 @@ def init_db():
 
             # Migration: Update existing workspaces named 'Sahaj Workspace' to 'Default Workspace'
             cursor.execute("UPDATE workspaces SET name = 'Default Workspace' WHERE name = 'Sahaj Workspace';")
+
+            # Migration: Ensure is_pinned column exists in conversations table
+            try:
+                cursor.execute("ALTER TABLE conversations ADD COLUMN is_pinned BOOLEAN DEFAULT FALSE;")
+            except Exception:
+                pass
 
         conn.close()
         print(f"[DB] MySQL database `{db_name}` initialized successfully.")
@@ -499,6 +506,16 @@ def update_conversation_title(conversation_id, user_id, title):
     try:
         with conn.cursor() as cursor:
             cursor.execute("UPDATE conversations SET title = %s WHERE id = %s AND user_id = %s", (title, conversation_id, user_id))
+            return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def update_conversation_pin(conversation_id, user_id, is_pinned):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE conversations SET is_pinned = %s WHERE id = %s AND user_id = %s", (is_pinned, conversation_id, user_id))
             return cursor.rowcount > 0
     finally:
         conn.close()

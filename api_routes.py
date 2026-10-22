@@ -624,6 +624,9 @@ def list_workspace_conversations(workspace_id):
     try:
         user_id = request.current_user['id']
         conversations = db.get_workspace_conversations(workspace_id, user_id)
+        for c in conversations:
+            if 'is_pinned' in c:
+                c['is_pinned'] = bool(c['is_pinned'])
         return jsonify({'success': True, 'conversations': conversations})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -646,6 +649,8 @@ def create_new_conversation(workspace_id):
         user_id = request.current_user['id']
         db.create_conversation(conversation_id, workspace_id, user_id, title, model, jailbreak)
         conv = db.get_conversation(conversation_id, user_id)
+        if conv and 'is_pinned' in conv:
+            conv['is_pinned'] = bool(conv['is_pinned'])
         return jsonify({'success': True, 'conversation': conv}), 201
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -659,6 +664,9 @@ def get_conversation_history(conversation_id):
         conv = db.get_conversation(conversation_id, user_id)
         if not conv:
             return jsonify({'success': False, 'error': 'Conversation not found'}), 404
+
+        if 'is_pinned' in conv:
+            conv['is_pinned'] = bool(conv['is_pinned'])
 
         messages = db.get_conversation_messages(conversation_id)
         return jsonify({
@@ -674,14 +682,41 @@ def get_conversation_history(conversation_id):
 @token_required
 def update_conversation(conversation_id):
     data = request.get_json() or {}
-    title = data.get('title', '').strip()
-    if not title:
-        return jsonify({'success': False, 'error': 'Title is required'}), 400
+    title = data.get('title', '').strip() if 'title' in data else None
+    is_pinned = data.get('is_pinned')
+    if title is None and is_pinned is None:
+        return jsonify({'success': False, 'error': 'No update parameters provided'}), 400
 
     try:
         user_id = request.current_user['id']
-        db.update_conversation_title(conversation_id, user_id, title)
-        return jsonify({'success': True, 'title': title})
+        if is_pinned is not None:
+            db.update_conversation_pin(conversation_id, user_id, bool(is_pinned))
+        if title is not None:
+            db.update_conversation_title(conversation_id, user_id, title)
+        conv = db.get_conversation(conversation_id, user_id)
+        if conv and 'is_pinned' in conv:
+            conv['is_pinned'] = bool(conv['is_pinned'])
+        return jsonify({'success': True, 'conversation': conv, 'title': title, 'is_pinned': is_pinned})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@api_bp.route('/conversations/<string:conversation_id>/pin', methods=['PATCH', 'POST'])
+@token_required
+def toggle_pin_conversation_route(conversation_id):
+    data = request.get_json() or {}
+    user_id = request.current_user['id']
+    try:
+        is_pinned = data.get('is_pinned')
+        if is_pinned is None:
+            conv = db.get_conversation(conversation_id, user_id)
+            if not conv:
+                return jsonify({'success': False, 'error': 'Conversation not found'}), 404
+            is_pinned = not bool(conv.get('is_pinned', False))
+        else:
+            is_pinned = bool(is_pinned)
+        db.update_conversation_pin(conversation_id, user_id, is_pinned)
+        return jsonify({'success': True, 'is_pinned': is_pinned})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
